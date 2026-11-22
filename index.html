@@ -7,11 +7,11 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
     body { background: #141414; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 8px; padding: 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
-    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 14px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; flex-wrap: wrap; }
+    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
     .btn:active { background: #444; }
     .btn-primary { background: #e65100; border-color: #ff6d00; font-weight: 600; }
-    #status { margin-left: auto; font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #status { margin-left: auto; font-size: 11px; color: #bbb; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     canvas { flex: 1; width: 100%; height: 100%; touch-action: none; display: block; }
     input[type="file"] { display: none; }
   </style>
@@ -42,9 +42,9 @@
   let entities = [];
   let blocks = {};
   let bounds = null;
-
   let scale = 1, offsetX = 0, offsetY = 0;
 
+  // Инициализация WASM
   (async () => {
     const urls = [
       'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/wasm',
@@ -58,7 +58,7 @@
         return;
       } catch (e) {}
     }
-    statusEl.textContent = 'Ошибка WASM';
+    statusEl.textContent = 'Ошибка загрузки WASM';
   })();
 
   function resize() {
@@ -71,46 +71,86 @@
   window.addEventListener('resize', resize);
   resize();
 
+  // Очистка MTEXT от кодов форматирования AutoCAD (\P, \H..., \f...; и т.д.)
+  function cleanText(raw) {
+    if (!raw) return '';
+    return String(raw)
+      .replace(/\\P/g, ' ')
+      .replace(/\\[A-Za-z][^;]*;/g, '')
+      .replace(/[{}]/g, '')
+      .replace(/%%[cC]/g, 'Ø')
+      .replace(/%%[dD]/g, '°')
+      .replace(/%%[pP]/g, '±')
+      .trim();
+  }
+
   fileInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file || !libredwg) return;
 
-    statusEl.textContent = 'Читаю...';
+    const sizeMB = (file.size / 1024 / 1024).toFixed(1);
+    statusEl.textContent = `Читаю (${sizeMB} МБ)...`;
+
+    // Даём браузеру перерисовать статус перед тяжёлым парсингом
+    await new Promise(r => setTimeout(r, 30));
+
     try {
       const buffer = await file.arrayBuffer();
       const dwg = libredwg.dwg_read_data(new Uint8Array(buffer), Dwg_File_Type.DWG);
+      if (!dwg) {
+        statusEl.textContent = `Не прочитан (${sizeMB} МБ): возможно новая версия DWG`;
+        return;
+      }
+
       const db = libredwg.convert(dwg);
       libredwg.dwg_free(dwg);
 
-      entities = db.entities || [];
       blocks = {};
       const br = db.tables?.BLOCK_RECORD?.entries || [];
       for (const b of br) {
         if (b.name && b.entities) blocks[b.name] = b.entities;
       }
 
-      // Считаем типы объектов для диагностики
+      entities = db.entities || [];
+
+      // Если в Модели пусто, пробуем взять из Листа (Paper Space)
+      if (!entities.length && blocks['*Paper_Space']?.length) {
+        entities = blocks['*Paper_Space'];
+      }
+
+      if (!entities.length) {
+        statusEl.textContent = `Пусто (0 эл., блоков: ${Object.keys(blocks).length})`;
+        bounds = null;
+        draw();
+        return;
+      }
+
       const counts = {};
       for (const ent of entities) counts[ent.type] = (counts[ent.type] || 0) + 1;
-      const summary = Object.entries(counts).slice(0, 4).map(([k, v]) => `${k}:${v}`).join(' ');
+      const top = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([k, v]) => `${k}:${v}`)
+        .join(' ');
 
       calcBounds();
       fitToScreen();
-      statusEl.textContent = `${entities.length} эл. (${summary || 'пусто'})`;
+      statusEl.textContent = `${entities.length} эл. | ${top}`;
     } catch (err) {
-      statusEl.textContent = 'Ошибка: ' + err.message;
+      statusEl.textContent = `Сбой (${sizeMB} МБ): ${err.message || err}`;
+      console.error(err);
     }
   });
 
   function walkEntities(list, fn, depth = 0, m = [1, 0, 0, 1, 0, 0]) {
     if (depth > 8 || !list) return;
     for (const e of list) {
+      // Раскрываем и обычные блоки INSERT, и блоки размеров DIMENSION
       if (e.type === 'INSERT' && e.name && blocks[e.name]) {
         const ip = e.insertionPoint || { x: 0, y: 0 };
         const sx = e.xScale ?? 1, sy = e.yScale ?? 1;
         const rot = e.rotation || 0;
         const c = Math.cos(rot), s = Math.sin(rot);
-        // Умножение матриц трансформации блока
         const nm = [
           m[0]*c*sx + m[2]*s*sx,
           m[1]*c*sx + m[3]*s*sx,
@@ -120,6 +160,9 @@
           m[1]*ip.x + m[3]*ip.y + m[5]
         ];
         walkEntities(blocks[e.name], fn, depth + 1, nm);
+      } else if (e.type === 'DIMENSION' && e.name && blocks[e.name]) {
+        // Размеры в DWG почти всегда хранят свою геометрию и цифры в скрытом блоке *D...
+        walkEntities(blocks[e.name], fn, depth + 1, m);
       } else {
         fn(e, m);
       }
@@ -151,6 +194,13 @@
       } else if ((e.type === 'CIRCLE' || e.type === 'ARC') && e.center) {
         add(m, e.center.x - e.radius, e.center.y - e.radius);
         add(m, e.center.x + e.radius, e.center.y + e.radius);
+      } else if (e.type === 'SPLINE') {
+        const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
+        if (pts) for (const p of pts) add(m, p.x, p.y);
+      } else if (e.type === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
+        const r = Math.hypot(e.majorAxisEndPoint.x, e.majorAxisEndPoint.y);
+        add(m, e.center.x - r, e.center.y - r);
+        add(m, e.center.x + r, e.center.y + r);
       }
     });
     bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
@@ -172,6 +222,8 @@
     const w = canvas.clientWidth, h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
     if (!entities.length) return;
+
+    const texts = [];
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
@@ -206,12 +258,61 @@
         const sy = cy + Math.sin(e.startAngle) * r;
         ctx.moveTo(sx, sy);
         ctx.arc(cx, cy, r, e.startAngle, e.endAngle);
+      } else if (e.type === 'SPLINE') {
+        const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
+        if (pts && pts.length > 1) {
+          const [x0, y0] = tx(m, pts[0].x, pts[0].y);
+          ctx.moveTo(x0, y0);
+          for (let i = 1; i < pts.length; i++) {
+            const [xi, yi] = tx(m, pts[i].x, pts[i].y);
+            ctx.lineTo(xi, yi);
+          }
+        }
+      } else if (e.type === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
+        const [cx, cy] = tx(m, e.center.x, e.center.y);
+        const sc = Math.hypot(m[0], m[1]);
+        const rx = Math.hypot(e.majorAxisEndPoint.x, e.majorAxisEndPoint.y) * sc;
+        const ry = rx * (e.axisRatio || 1);
+        const rot = Math.atan2(e.majorAxisEndPoint.y, e.majorAxisEndPoint.x);
+        const start = e.startAngle ?? 0;
+        const end = e.endAngle ?? Math.PI * 2;
+        ctx.moveTo(
+          cx + rx * Math.cos(start) * Math.cos(rot) - ry * Math.sin(start) * Math.sin(rot),
+          cy + rx * Math.cos(start) * Math.sin(rot) + ry * Math.sin(start) * Math.cos(rot)
+        );
+        ctx.ellipse(cx, cy, rx, ry, rot, start, end);
+      } else if (e.type === 'TEXT' || e.type === 'MTEXT') {
+        const pt = e.startPoint || e.insertionPoint || e.position;
+        const str = cleanText(e.text);
+        if (pt && str) {
+          const [px, py] = tx(m, pt.x, pt.y);
+          const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
+          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0 });
+        }
       }
     });
     ctx.stroke();
     ctx.restore();
+
+    // Рисуем текст и цифры размеров (только если они крупнее 4 пикселей на экране)
+    ctx.fillStyle = '#ffd54f';
+    for (const t of texts) {
+      const pxH = t.h * scale;
+      if (pxH < 4) continue;
+      const sx = offsetX + t.x * scale;
+      const sy = offsetY - t.y * scale;
+      if (sx < -200 || sx > w + 200 || sy < -50 || sy > h + 50) continue;
+
+      ctx.save();
+      ctx.translate(sx, sy);
+      if (t.rot) ctx.rotate(-t.rot);
+      ctx.font = `${Math.min(pxH, 60)}px sans-serif`;
+      ctx.fillText(t.str, 0, 0);
+      ctx.restore();
+    }
   }
 
+  // Управление: тач и мышь
   let pointers = new Map(), lastDist = 0, lastCenter = null;
 
   canvas.addEventListener('pointerdown', (e) => {
@@ -265,6 +366,5 @@
     draw();
   }, { passive: false });
 </script>
-
 </body>
 </html>
