@@ -44,19 +44,19 @@
   let libredwg = null;
   let blocks = {};
   let layers = {};
-  let bakedPaths = new Map(); // color -> Path2D
+  let bakedPaths = new Map();
   let bakedTexts = [];
-  let snapPoints = []; // [x1, y1, x2, y2, ...]
+  let snapPoints = [];
   let bounds = null;
 
   let scale = 1, offsetX = 0, offsetY = 0;
   let rafId = null;
 
-  // Линейка
+  // Линейка и лупа
   let measureMode = false;
   let measurePts = []; // [{x, y, snapped}]
+  let activeDragIdx = null; // индекс точки, которую сейчас тащим (0 или 1)
 
-  // Базовая палитра AutoCAD (ACI)
   const ACI = {
     1: '#ff3b30', 2: '#ffd60a', 3: '#34c759', 4: '#32ade6',
     5: '#0a84ff', 6: '#ff2d55', 7: '#e5e5e5', 8: '#8e8e93', 9: '#c7c7cc',
@@ -81,11 +81,9 @@
       return '#' + (e.color & 0xffffff).toString(16).padStart(6, '0');
     }
     const ci = e.colorIndex;
-    if (ci === 0) return parentColor; // ByBlock
+    if (ci === 0) return parentColor;
     if (ci !== undefined && ci !== null && ci !== 256) return aciToHex(ci);
-    // ByLayer
-    const lColor = layers[e.layer];
-    return lColor || parentColor;
+    return layers[e.layer] || parentColor;
   }
 
   (async () => {
@@ -124,9 +122,16 @@
 
   rulerBtn.addEventListener('click', () => {
     measureMode = !measureMode;
-    measurePts = [];
+    activeDragIdx = null;
     rulerBtn.classList.toggle('btn-active', measureMode);
-    statusEl.textContent = measureMode ? 'Ткни в 2 точки' : 'Готов';
+    if (measureMode) {
+      const pt = findSnap(canvas.clientWidth / 2, canvas.clientHeight / 2);
+      measurePts = [pt];
+      statusEl.textContent = 'Тащи точку 1';
+    } else {
+      measurePts = [];
+      statusEl.textContent = 'Готов';
+    }
     requestDraw();
   });
 
@@ -196,9 +201,7 @@
       if (py < minY) minY = py;
       if (px > maxX) maxX = px;
       if (py > maxY) maxY = py;
-      if (isSnap && snaps.length < 120000) {
-        snaps.push(px, py);
-      }
+      if (isSnap && snaps.length < 120000) snaps.push(px, py);
     };
 
     walkEntities(entities, (e, m, col) => {
@@ -322,19 +325,15 @@
       libredwg.dwg_free(dwg);
 
       layers = {};
-      const layerEntries = db.tables?.LAYER?.entries || [];
-      for (const l of layerEntries) {
+      for (const l of (db.tables?.LAYER?.entries || [])) {
         if (!l.name) continue;
-        if (l.color && typeof l.color === 'number' && l.color > 0) {
-          layers[l.name] = '#' + (l.color & 0xffffff).toString(16).padStart(6, '0');
-        } else {
-          layers[l.name] = aciToHex(l.colorIndex ?? 7);
-        }
+        layers[l.name] = (l.color && typeof l.color === 'number' && l.color > 0)
+          ? '#' + (l.color & 0xffffff).toString(16).padStart(6, '0')
+          : aciToHex(l.colorIndex ?? 7);
       }
 
       blocks = {};
-      const br = db.tables?.BLOCK_RECORD?.entries || [];
-      for (const b of br) {
+      for (const b of (db.tables?.BLOCK_RECORD?.entries || [])) {
         if (b.name && b.entities) blocks[b.name] = b.entities;
       }
 
@@ -344,6 +343,7 @@
       }
 
       measurePts = [];
+      activeDragIdx = null;
       if (!entities.length) {
         bakedPaths.clear();
         bakedTexts = [];
@@ -383,7 +383,7 @@
   }
 
   function findSnap(sx, sy) {
-    const radiusSq = 28 * 28; // радиус привязки 28 пикселей
+    const radiusSq = 28 * 28;
     let bestDist = radiusSq;
     let bestPt = null;
     for (let i = 0; i < snapPoints.length; i += 2) {
@@ -399,6 +399,58 @@
     if (bestPt) return bestPt;
     const [wx, wy] = screenToWorld(sx, sy);
     return { x: wx, y: wy, snapped: false };
+  }
+
+  function drawLoupe(pt) {
+    const r = 68;
+    const cx = 16 + r;
+    const cy = 16 + r;
+    const loupeScale = scale * 3.0;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+
+    ctx.fillStyle = '#101010';
+    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+
+    // Рисуем увеличенную геометрию
+    if (bakedPaths.size) {
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(loupeScale, -loupeScale);
+      ctx.translate(-pt.x, -pt.y);
+      ctx.lineWidth = 1.4 / loupeScale;
+      for (const [col, path] of bakedPaths) {
+        ctx.strokeStyle = col;
+        ctx.stroke(path);
+      }
+      ctx.restore();
+    }
+
+    // Перекрестие в центре лупы
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy);
+    ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
+    ctx.stroke();
+
+    // Индикатор привязки в центре
+    ctx.strokeStyle = pt.snapped ? '#00e676' : '#ff9100';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(cx - 7, cy - 7, 14, 14);
+    ctx.restore();
+
+    // Ободок лупы
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.strokeStyle = pt.snapped ? '#00e676' : '#888';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.restore();
   }
 
   function draw() {
@@ -417,7 +469,6 @@
       ctx.restore();
     }
 
-    // Текст и размеры
     for (let i = 0; i < bakedTexts.length; i++) {
       const t = bakedTexts[i];
       const pxH = t.h * scale;
@@ -435,7 +486,7 @@
       ctx.restore();
     }
 
-    // Отрисовка линейки
+    // Линейка
     if (measurePts.length) {
       const ptsScreen = measurePts.map(p => ({
         sx: offsetX + p.x * scale,
@@ -471,13 +522,26 @@
         ctx.restore();
       }
 
-      for (const p of ptsScreen) {
+      // Маркеры точек (удобные для захвата пальцем)
+      for (let i = 0; i < ptsScreen.length; i++) {
+        const p = ptsScreen[i];
+        const col = p.snapped ? '#00e676' : '#ff9100';
         ctx.save();
-        ctx.strokeStyle = p.snapped ? '#00e676' : '#ff9100';
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, 16, 0, Math.PI * 2);
+        ctx.fillStyle = i === activeDragIdx ? 'rgba(0, 230, 118, 0.25)' : 'rgba(255, 255, 255, 0.12)';
+        ctx.fill();
+        ctx.strokeStyle = col;
         ctx.lineWidth = 2;
-        ctx.strokeRect(p.sx - 6, p.sy - 6, 12, 12);
+        ctx.stroke();
+        ctx.strokeRect(p.sx - 4, p.sy - 4, 8, 8);
         ctx.restore();
       }
+    }
+
+    // Лупа при перетаскивании точки
+    if (activeDragIdx !== null && measurePts[activeDragIdx]) {
+      drawLoupe(measurePts[activeDragIdx]);
     }
   }
 
@@ -487,11 +551,30 @@
 
   canvas.addEventListener('pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
     if (pointers.size === 1) {
       downPos = { x: e.clientX, y: e.clientY };
       moved = false;
+
+      // Проверяем, схватил ли палец одну из точек линейки
+      if (measureMode && measurePts.length) {
+        let hitIdx = null, bestD = 36 * 36;
+        for (let i = 0; i < measurePts.length; i++) {
+          const px = offsetX + measurePts[i].x * scale;
+          const py = offsetY - measurePts[i].y * scale;
+          const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
+          if (d < bestD) { bestD = d; hitIdx = i; }
+        }
+        if (hitIdx !== null) {
+          activeDragIdx = hitIdx;
+          requestDraw();
+        }
+      }
     } else if (pointers.size === 2) {
+      activeDragIdx = null;
       moved = true;
       const [p1, p2] = [...pointers.values()];
       lastDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
@@ -506,6 +589,19 @@
     pointers.set(e.pointerId, curr);
 
     if (pointers.size === 1) {
+      if (activeDragIdx !== null) {
+        const rect = canvas.getBoundingClientRect();
+        measurePts[activeDragIdx] = findSnap(e.clientX - rect.left, e.clientY - rect.top);
+        if (measurePts.length === 2) {
+          const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
+          statusEl.textContent = `Замер: ${d.toFixed(1)}`;
+        } else {
+          statusEl.textContent = measurePts[0].snapped ? 'Привязка!' : 'Точка 1';
+        }
+        requestDraw();
+        return;
+      }
+
       if (downPos && Math.hypot(curr.x - downPos.x, curr.y - downPos.y) > 8) moved = true;
       offsetX += curr.x - prev.x;
       offsetY += curr.y - prev.y;
@@ -527,18 +623,23 @@
   });
 
   const endPointer = (e) => {
-    if (measureMode && !moved && pointers.size === 1) {
+    if (activeDragIdx !== null) {
+      // Отпустили первую точку — сразу создаём вторую рядом, чтобы можно было тащить её
+      if (measurePts.length === 1) {
+        const p0x = offsetX + measurePts[0].x * scale;
+        const p0y = offsetY - measurePts[0].y * scale;
+        const shiftX = p0x + 80 < canvas.clientWidth ? 80 : -80;
+        measurePts.push(findSnap(p0x + shiftX, p0y));
+        statusEl.textContent = 'Тащи точку 2';
+      }
+      activeDragIdx = null;
+      requestDraw();
+    } else if (measureMode && !moved && pointers.size === 1) {
+      // Обычный тап в режиме линейки тоже работает
       const rect = canvas.getBoundingClientRect();
       const pt = findSnap(e.clientX - rect.left, e.clientY - rect.top);
       if (measurePts.length >= 2) measurePts = [pt];
       else measurePts.push(pt);
-
-      if (measurePts.length === 2) {
-        const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
-        statusEl.textContent = `Замер: ${d.toFixed(1)}`;
-      } else {
-        statusEl.textContent = pt.snapped ? 'Точка 1 (привязка)' : 'Точка 1';
-      }
       requestDraw();
     }
     pointers.delete(e.pointerId);
