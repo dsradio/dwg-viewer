@@ -47,16 +47,25 @@
   let offsetX = 0;
   let offsetY = 0;
 
-    // Инициализация WASM
+      // Инициализация WASM
   (async () => {
-    try {
-      libredwg = await LibreDwg.create('https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/wasm/');
-      statusEl.textContent = 'Готов';
-    } catch (err) {
-      statusEl.textContent = 'Ошибка: ' + (err.message || err);
-      console.error(err);
+    const urls = [
+      'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/wasm',
+      'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/dist',
+      'https://unpkg.com/@mlightcad/libredwg-web/wasm'
+    ];
+    for (const url of urls) {
+      try {
+        libredwg = await LibreDwg.create(url);
+        statusEl.textContent = 'Готов';
+        return;
+      } catch (err) {
+        console.warn('Не подошёл:', url);
+      }
     }
+    statusEl.textContent = 'Ошибка загрузки WASM';
   })();
+
 
 
   function resize() {
