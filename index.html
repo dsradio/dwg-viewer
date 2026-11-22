@@ -24,7 +24,7 @@
     DWG
     <input type="file" id="fileInput" accept=".dwg">
   </label>
-  <button class="btn" id="fitBtn">Вписать</button>
+  <button class="btn" id="fitBtn">Центровать</button>
   <button class="btn" id="rulerBtn">Линейка</button>
   <div id="status">Загрузка...</div>
 </header>
@@ -46,7 +46,8 @@
   let layers = {};
   let bakedPaths = new Map();
   let bakedTexts = [];
-  let snapPoints = [];
+  let snapPoints = [];   // [x, y, ...] углы, концы, центры
+  let snapSegments = []; // [x1, y1, x2, y2, ...] отрезки для примагничивания к самой линии
   let bounds = null;
 
   let scale = 1, offsetX = 0, offsetY = 0;
@@ -54,8 +55,8 @@
 
   // Линейка и лупа
   let measureMode = false;
-  let measurePts = []; // [{x, y, snapped}]
-  let activeDragIdx = null; // индекс точки, которую сейчас тащим (0 или 1)
+  let measurePts = []; // [{x, y, snapType: 'point'|'line'|null}]
+  let activeDragIdx = null;
 
   const ACI = {
     1: '#ff3b30', 2: '#ffd60a', 3: '#34c759', 4: '#32ade6',
@@ -170,7 +171,7 @@
           m[1]*ip.x + m[3]*ip.y + m[5]
         ];
         walkEntities(blocks[bName], fn, depth + 1, nm, col);
-      } else if (e.type === 'DIMENSION') {
+      } else if (e.type && e.type.startsWith('DIMENSION')) {
         if (bName && blocks[bName]) {
           walkEntities(blocks[bName], fn, depth + 1, m, col);
         } else {
@@ -186,6 +187,8 @@
     const paths = new Map();
     const texts = [];
     const snaps = [];
+    const segs = [];
+    const skipped = {};
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
     const getPath = (col) => {
@@ -204,8 +207,14 @@
       if (isSnap && snaps.length < 120000) snaps.push(px, py);
     };
 
+    const addSeg = (x1, y1, x2, y2) => {
+      if (segs.length < 200000) segs.push(x1, y1, x2, y2);
+    };
+
     walkEntities(entities, (e, m, col) => {
-      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
+      const t = e.type || '';
+
+      if (t === 'LINE' && e.startPoint && e.endPoint) {
         const [x1, y1] = tx(m, e.startPoint.x, e.startPoint.y);
         const [x2, y2] = tx(m, e.endPoint.x, e.endPoint.y);
         const p = getPath(col);
@@ -213,18 +222,25 @@
         p.lineTo(x2, y2);
         addBound(x1, y1, true);
         addBound(x2, y2, true);
-      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices?.length > 1) {
+        addSeg(x1, y1, x2, y2);
+      } else if (t.includes('POLYLINE') && e.vertices?.length > 1) {
         const p = getPath(col);
-        const [x0, y0] = tx(m, e.vertices[0].x, e.vertices[0].y);
+        let [px, py] = tx(m, e.vertices[0].x, e.vertices[0].y);
+        const [x0, y0] = [px, py];
         p.moveTo(x0, y0);
         addBound(x0, y0, true);
         for (let i = 1; i < e.vertices.length; i++) {
           const [xi, yi] = tx(m, e.vertices[i].x, e.vertices[i].y);
           p.lineTo(xi, yi);
           addBound(xi, yi, true);
+          addSeg(px, py, xi, yi);
+          px = xi; py = yi;
         }
-        if (e.flag & 1) p.lineTo(x0, y0);
-      } else if (e.type === 'CIRCLE' && e.center) {
+        if (e.flag & 1) {
+          p.lineTo(x0, y0);
+          addSeg(px, py, x0, y0);
+        }
+      } else if (t === 'CIRCLE' && e.center) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
         if (r > 0 && Number.isFinite(r)) {
@@ -235,32 +251,37 @@
           addBound(cx - r, cy - r);
           addBound(cx + r, cy + r);
         }
-      } else if (e.type === 'ARC' && e.center) {
+      } else if (t === 'ARC' && e.center) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
         if (r > 0 && Number.isFinite(r)) {
           const p = getPath(col);
           const sx = cx + Math.cos(e.startAngle) * r;
           const sy = cy + Math.sin(e.startAngle) * r;
+          const ex = cx + Math.cos(e.endAngle) * r;
+          const ey = cy + Math.sin(e.endAngle) * r;
           p.moveTo(sx, sy);
           p.arc(cx, cy, r, e.startAngle, e.endAngle);
           addBound(cx, cy, true);
           addBound(sx, sy, true);
+          addBound(ex, ey, true);
         }
-      } else if (e.type === 'SPLINE') {
+      } else if (t === 'SPLINE') {
         const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
         if (pts && pts.length > 1) {
           const p = getPath(col);
-          const [x0, y0] = tx(m, pts[0].x, pts[0].y);
-          p.moveTo(x0, y0);
-          addBound(x0, y0, true);
+          let [px, py] = tx(m, pts[0].x, pts[0].y);
+          p.moveTo(px, py);
+          addBound(px, py, true);
           for (let i = 1; i < pts.length; i++) {
             const [xi, yi] = tx(m, pts[i].x, pts[i].y);
             p.lineTo(xi, yi);
             addBound(xi, yi);
+            addSeg(px, py, xi, yi);
+            px = xi; py = yi;
           }
         }
-      } else if (e.type === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
+      } else if (t === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const sc = Math.hypot(m[0], m[1]);
         const rx = Math.hypot(e.majorAxisEndPoint.x, e.majorAxisEndPoint.y) * sc;
@@ -277,7 +298,68 @@
           p.ellipse(cx, cy, rx, ry, rot, start, end);
           addBound(cx, cy, true);
         }
-      } else if (e.type === 'TEXT' || e.type === 'MTEXT' || e.type === 'ATTRIB' || e.type === 'ATTDEF') {
+      } else if (t === 'SOLID' || t === '3DFACE' || t === 'TRACE') {
+        const pts = [e.corner1, e.corner2, e.corner4, e.corner3].filter(Boolean);
+        if (pts.length >= 3) {
+          const p = getPath(col);
+          let [x0, y0] = tx(m, pts[0].x, pts[0].y);
+          let px = x0, py = y0;
+          p.moveTo(x0, y0);
+          addBound(x0, y0, true);
+          for (let i = 1; i < pts.length; i++) {
+            const [xi, yi] = tx(m, pts[i].x, pts[i].y);
+            p.lineTo(xi, yi);
+            addBound(xi, yi, true);
+            addSeg(px, py, xi, yi);
+            px = xi; py = yi;
+          }
+          p.lineTo(x0, y0);
+          addSeg(px, py, x0, y0);
+        }
+      } else if (t === 'LEADER' && e.vertices?.length > 1) {
+        const p = getPath(col);
+        let [px, py] = tx(m, e.vertices[0].x, e.vertices[0].y);
+        p.moveTo(px, py);
+        addBound(px, py, true);
+        for (let i = 1; i < e.vertices.length; i++) {
+          const [xi, yi] = tx(m, e.vertices[i].x, e.vertices[i].y);
+          p.lineTo(xi, yi);
+          addBound(xi, yi, true);
+          addSeg(px, py, xi, yi);
+          px = xi; py = yi;
+        }
+      } else if (t === 'HATCH' && e.boundaryPaths) {
+        const p = getPath(col);
+        for (const bp of e.boundaryPaths) {
+          const verts = bp.vertices || bp.polylinePath?.vertices;
+          if (verts?.length > 1) {
+            let [x0, y0] = tx(m, verts[0].x, verts[0].y);
+            let px = x0, py = y0;
+            p.moveTo(x0, y0);
+            addBound(x0, y0);
+            for (let i = 1; i < verts.length; i++) {
+              const [xi, yi] = tx(m, verts[i].x, verts[i].y);
+              p.lineTo(xi, yi);
+              addBound(xi, yi);
+              addSeg(px, py, xi, yi);
+              px = xi; py = yi;
+            }
+            p.lineTo(x0, y0);
+          } else if (bp.edges) {
+            for (const ed of bp.edges) {
+              if (ed.start && ed.end) {
+                const [x1, y1] = tx(m, ed.start.x, ed.start.y);
+                const [x2, y2] = tx(m, ed.end.x, ed.end.y);
+                p.moveTo(x1, y1);
+                p.lineTo(x2, y2);
+                addBound(x1, y1);
+                addBound(x2, y2);
+                addSeg(x1, y1, x2, y2);
+              }
+            }
+          }
+        }
+      } else if (t === 'TEXT' || t === 'MTEXT' || t === 'ATTRIB' || t === 'ATTDEF') {
         const pt = e.startPoint || e.insertionPoint || e.position || e.alignmentPoint;
         const str = cleanText(e.text ?? e.textString ?? e.contents);
         if (pt && str) {
@@ -285,7 +367,7 @@
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
           texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0, col });
         }
-      } else if (e.type === 'DIMENSION') {
+      } else if (t.startsWith('DIMENSION')) {
         const pt = e.textPoint || e.middleOfText || e.definitionPoint;
         let str = cleanText(e.text ?? e.textString);
         if (!str || str === '<>') {
@@ -296,13 +378,17 @@
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
           texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0, col });
         }
+      } else if (t && t !== 'POINT' && t !== 'VIEWPORT') {
+        skipped[t] = (skipped[t] || 0) + 1;
       }
     });
 
     bakedPaths = paths;
     bakedTexts = texts;
     snapPoints = snaps;
+    snapSegments = segs;
     bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
+    return skipped;
   }
 
   fileInput.addEventListener('change', async (e) => {
@@ -348,6 +434,7 @@
         bakedPaths.clear();
         bakedTexts = [];
         snapPoints = [];
+        snapSegments = [];
         bounds = null;
         statusEl.textContent = 'Пусто (0 эл.)';
         requestDraw();
@@ -357,9 +444,14 @@
       statusEl.textContent = `Сборка (${entities.length} эл.)...`;
       await new Promise(r => setTimeout(r, 15));
 
-      bakeGeometry(entities);
+      const skipped = bakeGeometry(entities);
       fitToScreen();
-      statusEl.textContent = `${entities.length} эл. | цветов: ${bakedPaths.size}`;
+
+      const skipTop = Object.entries(skipped).sort((a, b) => b[1] - a[1]).slice(0, 2)
+        .map(([k, v]) => `${k}:${v}`).join(' ');
+      statusEl.textContent = skipTop
+        ? `${entities.length} эл. | скрыто: ${skipTop}`
+        : `${entities.length} эл. | OK`;
     } catch (err) {
       statusEl.textContent = `Сбой: ${err.message || err}`;
       console.error(err);
@@ -382,9 +474,10 @@
     return [(sx - offsetX) / scale, (offsetY - sy) / scale];
   }
 
+  // Магнитная привязка: 1) к углам/концам, 2) к самой линии
   function findSnap(sx, sy) {
-    const radiusSq = 28 * 28;
-    let bestDist = radiusSq;
+    // Приоритет 1: углы, концы линий, центры (радиус 26px)
+    let bestDist = 26 * 26;
     let bestPt = null;
     for (let i = 0; i < snapPoints.length; i += 2) {
       const wx = snapPoints[i], wy = snapPoints[i + 1];
@@ -393,12 +486,46 @@
       const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
       if (d < bestDist) {
         bestDist = d;
-        bestPt = { x: wx, y: wy, snapped: true };
+        bestPt = { x: wx, y: wy, snapType: 'point' };
       }
     }
     if (bestPt) return bestPt;
+
+    // Приоритет 2: ближайшая точка на любой линии (радиус 20px)
+    let bestSegDist = 20 * 20;
+    let bestSegPt = null;
+    for (let i = 0; i < snapSegments.length; i += 4) {
+      const x1 = offsetX + snapSegments[i] * scale;
+      const y1 = offsetY - snapSegments[i + 1] * scale;
+      const x2 = offsetX + snapSegments[i + 2] * scale;
+      const y2 = offsetY - snapSegments[i + 3] * scale;
+      const dx = x2 - x1, dy = y2 - y1;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1) continue;
+      let t = ((sx - x1) * dx + (sy - y1) * dy) / lenSq;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      const projX = x1 + t * dx;
+      const projY = y1 + t * dy;
+      const d = (projX - sx) * (projX - sx) + (projY - sy) * (projY - sy);
+      if (d < bestSegDist) {
+        bestSegDist = d;
+        bestSegPt = {
+          x: snapSegments[i] + t * (snapSegments[i + 2] - snapSegments[i]),
+          y: snapSegments[i + 1] + t * (snapSegments[i + 3] - snapSegments[i + 1]),
+          snapType: 'line'
+        };
+      }
+    }
+    if (bestSegPt) return bestSegPt;
+
     const [wx, wy] = screenToWorld(sx, sy);
-    return { x: wx, y: wy, snapped: false };
+    return { x: wx, y: wy, snapType: null };
+  }
+
+  function snapColor(snapType) {
+    if (snapType === 'point') return '#00e676'; // зелёный — угол/конец
+    if (snapType === 'line') return '#00e5ff';  // голубой — на линии
+    return '#ff9100';                           // оранжевый — свободно
   }
 
   function drawLoupe(pt) {
@@ -406,6 +533,7 @@
     const cx = 16 + r;
     const cy = 16 + r;
     const loupeScale = scale * 3.0;
+    const col = snapColor(pt.snapType);
 
     ctx.save();
     ctx.beginPath();
@@ -415,21 +543,19 @@
     ctx.fillStyle = '#101010';
     ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
 
-    // Рисуем увеличенную геометрию
     if (bakedPaths.size) {
       ctx.save();
       ctx.translate(cx, cy);
       ctx.scale(loupeScale, -loupeScale);
       ctx.translate(-pt.x, -pt.y);
       ctx.lineWidth = 1.4 / loupeScale;
-      for (const [col, path] of bakedPaths) {
-        ctx.strokeStyle = col;
+      for (const [c, path] of bakedPaths) {
+        ctx.strokeStyle = c;
         ctx.stroke(path);
       }
       ctx.restore();
     }
 
-    // Перекрестие в центре лупы
     ctx.strokeStyle = 'rgba(255,255,255,0.45)';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -437,17 +563,15 @@
     ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
     ctx.stroke();
 
-    // Индикатор привязки в центре
-    ctx.strokeStyle = pt.snapped ? '#00e676' : '#ff9100';
+    ctx.strokeStyle = col;
     ctx.lineWidth = 2;
     ctx.strokeRect(cx - 7, cy - 7, 14, 14);
     ctx.restore();
 
-    // Ободок лупы
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.strokeStyle = pt.snapped ? '#00e676' : '#888';
+    ctx.strokeStyle = col;
     ctx.lineWidth = 3;
     ctx.stroke();
     ctx.restore();
@@ -491,7 +615,7 @@
       const ptsScreen = measurePts.map(p => ({
         sx: offsetX + p.x * scale,
         sy: offsetY - p.y * scale,
-        snapped: p.snapped
+        snapType: p.snapType
       }));
 
       if (ptsScreen.length === 2) {
@@ -522,10 +646,9 @@
         ctx.restore();
       }
 
-      // Маркеры точек (удобные для захвата пальцем)
       for (let i = 0; i < ptsScreen.length; i++) {
         const p = ptsScreen[i];
-        const col = p.snapped ? '#00e676' : '#ff9100';
+        const col = snapColor(p.snapType);
         ctx.save();
         ctx.beginPath();
         ctx.arc(p.sx, p.sy, 16, 0, Math.PI * 2);
@@ -539,13 +662,11 @@
       }
     }
 
-    // Лупа при перетаскивании точки
     if (activeDragIdx !== null && measurePts[activeDragIdx]) {
       drawLoupe(measurePts[activeDragIdx]);
     }
   }
 
-  // Управление: тач и мышь
   let pointers = new Map(), lastDist = 0, lastCenter = null;
   let downPos = null, moved = false;
 
@@ -559,7 +680,6 @@
       downPos = { x: e.clientX, y: e.clientY };
       moved = false;
 
-      // Проверяем, схватил ли палец одну из точек линейки
       if (measureMode && measurePts.length) {
         let hitIdx = null, bestD = 36 * 36;
         for (let i = 0; i < measurePts.length; i++) {
@@ -596,7 +716,8 @@
           const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
           statusEl.textContent = `Замер: ${d.toFixed(1)}`;
         } else {
-          statusEl.textContent = measurePts[0].snapped ? 'Привязка!' : 'Точка 1';
+          const st = measurePts[0].snapType;
+          statusEl.textContent = st === 'point' ? 'Угол!' : st === 'line' ? 'Линия!' : 'Точка 1';
         }
         requestDraw();
         return;
@@ -624,7 +745,6 @@
 
   const endPointer = (e) => {
     if (activeDragIdx !== null) {
-      // Отпустили первую точку — сразу создаём вторую рядом, чтобы можно было тащить её
       if (measurePts.length === 1) {
         const p0x = offsetX + measurePts[0].x * scale;
         const p0y = offsetY - measurePts[0].y * scale;
@@ -635,7 +755,6 @@
       activeDragIdx = null;
       requestDraw();
     } else if (measureMode && !moved && pointers.size === 1) {
-      // Обычный тап в режиме линейки тоже работает
       const rect = canvas.getBoundingClientRect();
       const pt = findSnap(e.clientX - rect.left, e.clientY - rect.top);
       if (measurePts.length >= 2) measurePts = [pt];
