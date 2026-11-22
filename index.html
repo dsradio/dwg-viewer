@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>DWG Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+    body { background: #141414; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; }
+    header { display: flex; align-items: center; gap: 8px; padding: 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
+    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 14px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    .btn:active { background: #444; }
+    .btn-primary { background: #e65100; border-color: #ff6d00; font-weight: 600; }
+    #status { margin-left: auto; font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    canvas { flex: 1; width: 100%; height: 100%; touch-action: none; display: block; }
+    input[type="file"] { display: none; }
+  </style>
+</head>
+<body>
+
+<header>
+  <label class="btn btn-primary">
+    Открыть DWG
+    <input type="file" id="fileInput" accept=".dwg">
+  </label>
+  <button class="btn" id="fitBtn">Вписать</button>
+  <div id="status">Загрузка движка...</div>
+</header>
+
+<canvas id="canvas"></canvas>
+
+<script type="module">
+  import { LibreDwg, Dwg_File_Type } from 'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/dist/libredwg-web.js';
+
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const fileInput = document.getElementById('fileInput');
+  const fitBtn = document.getElementById('fitBtn');
+
+  let libredwg = null;
+  let entities = [];
+  let bounds = null;
+
+  // Камера
+  let scale = 1;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  // Инициализация WASM
+  (async () => {
+    try {
+      libredwg = await LibreDwg.create('https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/dist/');
+      statusEl.textContent = 'Готов';
+    } catch (err) {
+      statusEl.textContent = 'Ошибка WASM';
+      console.error(err);
+    }
+  })();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Загрузка файла
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file || !libredwg) return;
+
+    statusEl.textContent = 'Читаю...';
+    try {
+      const buffer = await file.arrayBuffer();
+      const dwg = libredwg.dwg_read_data(new Uint8Array(buffer), Dwg_File_Type.DWG);
+      const db = libredwg.convert(dwg);
+      libredwg.dwg_free(dwg);
+
+      entities = db.entities || [];
+      calcBounds();
+      fitToScreen();
+      statusEl.textContent = `${file.name} (${entities.length} эл.)`;
+    } catch (err) {
+      statusEl.textContent = 'Ошибка чтения DWG';
+      console.error(err);
+    }
+  });
+
+  function calcBounds() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const expand = (x, y) => {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    };
+
+    for (const e of entities) {
+      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
+        expand(e.startPoint.x, e.startPoint.y);
+        expand(e.endPoint.x, e.endPoint.y);
+      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices) {
+        for (const v of e.vertices) expand(v.x, v.y);
+      } else if ((e.type === 'CIRCLE' || e.type === 'ARC') && e.center) {
+        expand(e.center.x - e.radius, e.center.y - e.radius);
+        expand(e.center.x + e.radius, e.center.y + e.radius);
+      }
+    }
+    bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
+  }
+
+  function fitToScreen() {
+    if (!bounds) return;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    const bw = bounds.maxX - bounds.minX || 1;
+    const bh = bounds.maxY - bounds.minY || 1;
+    scale = Math.min(w / bw, h / bh) * 0.9;
+    offsetX = w / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
+    offsetY = h / 2 + ((bounds.minY + bounds.maxY) / 2) * scale;
+    draw();
+  }
+  fitBtn.addEventListener('click', fitToScreen);
+
+  function draw() {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+    if (!entities.length) return;
+
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, -scale); // В CAD ось Y смотрит вверх
+    ctx.strokeStyle = '#e0e0e0';
+    ctx.lineWidth = 1 / scale;
+
+    ctx.beginPath();
+    for (const e of entities) {
+      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
+        ctx.moveTo(e.startPoint.x, e.startPoint.y);
+        ctx.lineTo(e.endPoint.x, e.endPoint.y);
+      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices?.length > 1) {
+        ctx.moveTo(e.vertices[0].x, e.vertices[0].y);
+        for (let i = 1; i < e.vertices.length; i++) {
+          ctx.lineTo(e.vertices[i].x, e.vertices[i].y);
+        }
+        if (e.flag & 1) ctx.closePath();
+      } else if (e.type === 'CIRCLE' && e.center) {
+        ctx.moveTo(e.center.x + e.radius, e.center.y);
+        ctx.arc(e.center.x, e.center.y, e.radius, 0, Math.PI * 2);
+      } else if (e.type === 'ARC' && e.center) {
+        const sx = e.center.x + Math.cos(e.startAngle) * e.radius;
+        const sy = e.center.y + Math.sin(e.startAngle) * e.radius;
+        ctx.moveTo(sx, sy);
+        ctx.arc(e.center.x, e.center.y, e.radius, e.startAngle, e.endAngle);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Управление: тач (1 палец — сдвиг, 2 — зум) и мышь
+  let pointers = new Map();
+  let lastDist = 0;
+  let lastCenter = null;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 2) {
+      const [p1, p2] = [...pointers.values()];
+      lastDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      lastCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    const prev = pointers.get(e.pointerId);
+    const curr = { x: e.clientX, y: e.clientY };
+    pointers.set(e.pointerId, curr);
+
+    if (pointers.size === 1) {
+      offsetX += curr.x - prev.x;
+      offsetY += curr.y - prev.y;
+      draw();
+    } else if (pointers.size === 2) {
+      const [p1, p2] = [...pointers.values()];
+      const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const center = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      if (lastDist > 0) {
+        const factor = dist / lastDist;
+        offsetX = center.x - (center.x - offsetX) * factor + (center.x - lastCenter.x);
+        offsetY = center.y - (center.y - offsetY) * factor + (center.y - lastCenter.y);
+        scale *= factor;
+        draw();
+      }
+      lastDist = dist;
+      lastCenter = center;
+    }
+  });
+
+  const endPointer = (e) => {
+    pointers.delete(e.pointerId);
+    lastDist = 0;
+  };
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    offsetX = mx - (mx - offsetX) * factor;
+    offsetY = my - (my - offsetY) * factor;
+    scale *= factor;
+    draw();
+  }, { passive: false });
+</script>
+</body>
+</html>
