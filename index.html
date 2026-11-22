@@ -40,14 +40,11 @@
 
   let libredwg = null;
   let entities = [];
+  let blocks = {};
   let bounds = null;
 
-  // Камера
-  let scale = 1;
-  let offsetX = 0;
-  let offsetY = 0;
+  let scale = 1, offsetX = 0, offsetY = 0;
 
-      // Инициализация WASM
   (async () => {
     const urls = [
       'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/wasm',
@@ -59,14 +56,10 @@
         libredwg = await LibreDwg.create(url);
         statusEl.textContent = 'Готов';
         return;
-      } catch (err) {
-        console.warn('Не подошёл:', url);
-      }
+      } catch (e) {}
     }
-    statusEl.textContent = 'Ошибка загрузки WASM';
+    statusEl.textContent = 'Ошибка WASM';
   })();
-
-
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -78,7 +71,6 @@
   window.addEventListener('resize', resize);
   resize();
 
-  // Загрузка файла
   fileInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file || !libredwg) return;
@@ -91,43 +83,82 @@
       libredwg.dwg_free(dwg);
 
       entities = db.entities || [];
+      blocks = {};
+      const br = db.tables?.BLOCK_RECORD?.entries || [];
+      for (const b of br) {
+        if (b.name && b.entities) blocks[b.name] = b.entities;
+      }
+
+      // Считаем типы объектов для диагностики
+      const counts = {};
+      for (const ent of entities) counts[ent.type] = (counts[ent.type] || 0) + 1;
+      const summary = Object.entries(counts).slice(0, 4).map(([k, v]) => `${k}:${v}`).join(' ');
+
       calcBounds();
       fitToScreen();
-      statusEl.textContent = `${file.name} (${entities.length} эл.)`;
+      statusEl.textContent = `${entities.length} эл. (${summary || 'пусто'})`;
     } catch (err) {
-      statusEl.textContent = 'Ошибка чтения DWG';
-      console.error(err);
+      statusEl.textContent = 'Ошибка: ' + err.message;
     }
   });
 
-  function calcBounds() {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const expand = (x, y) => {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-    };
-
-    for (const e of entities) {
-      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
-        expand(e.startPoint.x, e.startPoint.y);
-        expand(e.endPoint.x, e.endPoint.y);
-      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices) {
-        for (const v of e.vertices) expand(v.x, v.y);
-      } else if ((e.type === 'CIRCLE' || e.type === 'ARC') && e.center) {
-        expand(e.center.x - e.radius, e.center.y - e.radius);
-        expand(e.center.x + e.radius, e.center.y + e.radius);
+  function walkEntities(list, fn, depth = 0, m = [1, 0, 0, 1, 0, 0]) {
+    if (depth > 8 || !list) return;
+    for (const e of list) {
+      if (e.type === 'INSERT' && e.name && blocks[e.name]) {
+        const ip = e.insertionPoint || { x: 0, y: 0 };
+        const sx = e.xScale ?? 1, sy = e.yScale ?? 1;
+        const rot = e.rotation || 0;
+        const c = Math.cos(rot), s = Math.sin(rot);
+        // Умножение матриц трансформации блока
+        const nm = [
+          m[0]*c*sx + m[2]*s*sx,
+          m[1]*c*sx + m[3]*s*sx,
+          m[0]*(-s)*sy + m[2]*c*sy,
+          m[1]*(-s)*sy + m[3]*c*sy,
+          m[0]*ip.x + m[2]*ip.y + m[4],
+          m[1]*ip.x + m[3]*ip.y + m[5]
+        ];
+        walkEntities(blocks[e.name], fn, depth + 1, nm);
+      } else {
+        fn(e, m);
       }
     }
+  }
+
+  function tx(m, x, y) {
+    return [m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]];
+  }
+
+  function calcBounds() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const add = (m, x, y) => {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      const [px, py] = tx(m, x, y);
+      if (Math.abs(px) > 1e8 || Math.abs(py) > 1e8) return;
+      if (px < minX) minX = px;
+      if (py < minY) minY = py;
+      if (px > maxX) maxX = px;
+      if (py > maxY) maxY = py;
+    };
+
+    walkEntities(entities, (e, m) => {
+      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
+        add(m, e.startPoint.x, e.startPoint.y);
+        add(m, e.endPoint.x, e.endPoint.y);
+      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices) {
+        for (const v of e.vertices) add(m, v.x, v.y);
+      } else if ((e.type === 'CIRCLE' || e.type === 'ARC') && e.center) {
+        add(m, e.center.x - e.radius, e.center.y - e.radius);
+        add(m, e.center.x + e.radius, e.center.y + e.radius);
+      }
+    });
     bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
   }
 
   function fitToScreen() {
     if (!bounds) return;
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
     const bw = bounds.maxX - bounds.minX || 1;
     const bh = bounds.maxY - bounds.minY || 1;
     scale = Math.min(w / bw, h / bh) * 0.9;
@@ -138,46 +169,50 @@
   fitBtn.addEventListener('click', fitToScreen);
 
   function draw() {
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
     if (!entities.length) return;
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
-    ctx.scale(scale, -scale); // В CAD ось Y смотрит вверх
+    ctx.scale(scale, -scale);
     ctx.strokeStyle = '#e0e0e0';
     ctx.lineWidth = 1 / scale;
 
     ctx.beginPath();
-    for (const e of entities) {
+    walkEntities(entities, (e, m) => {
       if (e.type === 'LINE' && e.startPoint && e.endPoint) {
-        ctx.moveTo(e.startPoint.x, e.startPoint.y);
-        ctx.lineTo(e.endPoint.x, e.endPoint.y);
+        const [x1, y1] = tx(m, e.startPoint.x, e.startPoint.y);
+        const [x2, y2] = tx(m, e.endPoint.x, e.endPoint.y);
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
       } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices?.length > 1) {
-        ctx.moveTo(e.vertices[0].x, e.vertices[0].y);
+        const [x0, y0] = tx(m, e.vertices[0].x, e.vertices[0].y);
+        ctx.moveTo(x0, y0);
         for (let i = 1; i < e.vertices.length; i++) {
-          ctx.lineTo(e.vertices[i].x, e.vertices[i].y);
+          const [xi, yi] = tx(m, e.vertices[i].x, e.vertices[i].y);
+          ctx.lineTo(xi, yi);
         }
-        if (e.flag & 1) ctx.closePath();
+        if (e.flag & 1) ctx.lineTo(x0, y0);
       } else if (e.type === 'CIRCLE' && e.center) {
-        ctx.moveTo(e.center.x + e.radius, e.center.y);
-        ctx.arc(e.center.x, e.center.y, e.radius, 0, Math.PI * 2);
+        const [cx, cy] = tx(m, e.center.x, e.center.y);
+        const r = e.radius * Math.hypot(m[0], m[1]);
+        ctx.moveTo(cx + r, cy);
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
       } else if (e.type === 'ARC' && e.center) {
-        const sx = e.center.x + Math.cos(e.startAngle) * e.radius;
-        const sy = e.center.y + Math.sin(e.startAngle) * e.radius;
+        const [cx, cy] = tx(m, e.center.x, e.center.y);
+        const r = e.radius * Math.hypot(m[0], m[1]);
+        const sx = cx + Math.cos(e.startAngle) * r;
+        const sy = cy + Math.sin(e.startAngle) * r;
         ctx.moveTo(sx, sy);
-        ctx.arc(e.center.x, e.center.y, e.radius, e.startAngle, e.endAngle);
+        ctx.arc(cx, cy, r, e.startAngle, e.endAngle);
       }
-    }
+    });
     ctx.stroke();
     ctx.restore();
   }
 
-  // Управление: тач (1 палец — сдвиг, 2 — зум) и мышь
-  let pointers = new Map();
-  let lastDist = 0;
-  let lastCenter = null;
+  let pointers = new Map(), lastDist = 0, lastCenter = null;
 
   canvas.addEventListener('pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
@@ -215,10 +250,7 @@
     }
   });
 
-  const endPointer = (e) => {
-    pointers.delete(e.pointerId);
-    lastDist = 0;
-  };
+  const endPointer = (e) => { pointers.delete(e.pointerId); lastDist = 0; };
   canvas.addEventListener('pointerup', endPointer);
   canvas.addEventListener('pointercancel', endPointer);
 
@@ -226,13 +258,13 @@
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
     const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     offsetX = mx - (mx - offsetX) * factor;
     offsetY = my - (my - offsetY) * factor;
     scale *= factor;
     draw();
   }, { passive: false });
 </script>
+
 </body>
 </html>
