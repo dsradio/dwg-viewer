@@ -7,7 +7,7 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
     body { background: #141414; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; flex-wrap: wrap; }
+    header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
     .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
     .btn:active { background: #444; }
     .btn-primary { background: #e65100; border-color: #ff6d00; font-weight: 600; }
@@ -39,10 +39,13 @@
   const fitBtn = document.getElementById('fitBtn');
 
   let libredwg = null;
-  let entities = [];
   let blocks = {};
+  let bakedPath = null;
+  let bakedTexts = [];
   let bounds = null;
+
   let scale = 1, offsetX = 0, offsetY = 0;
+  let rafId = null;
 
   // Инициализация WASM
   (async () => {
@@ -61,19 +64,26 @@
     statusEl.textContent = 'Ошибка загрузки WASM';
   })();
 
+  function requestDraw() {
+    if (rafId) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      draw();
+    });
+  }
+
   function resize() {
     const dpr = window.devicePixelRatio || 1;
     canvas.width = canvas.clientWidth * dpr;
     canvas.height = canvas.clientHeight * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    draw();
+    requestDraw();
   }
   window.addEventListener('resize', resize);
   resize();
 
-  // Очистка MTEXT от кодов форматирования AutoCAD (\P, \H..., \f...; и т.д.)
   function cleanText(raw) {
-    if (!raw) return '';
+    if (raw === undefined || raw === null) return '';
     return String(raw)
       .replace(/\\P/g, ' ')
       .replace(/\\[A-Za-z][^;]*;/g, '')
@@ -84,69 +94,15 @@
       .trim();
   }
 
-  fileInput.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file || !libredwg) return;
-
-    const sizeMB = (file.size / 1024 / 1024).toFixed(1);
-    statusEl.textContent = `Читаю (${sizeMB} МБ)...`;
-
-    // Даём браузеру перерисовать статус перед тяжёлым парсингом
-    await new Promise(r => setTimeout(r, 30));
-
-    try {
-      const buffer = await file.arrayBuffer();
-      const dwg = libredwg.dwg_read_data(new Uint8Array(buffer), Dwg_File_Type.DWG);
-      if (!dwg) {
-        statusEl.textContent = `Не прочитан (${sizeMB} МБ): возможно новая версия DWG`;
-        return;
-      }
-
-      const db = libredwg.convert(dwg);
-      libredwg.dwg_free(dwg);
-
-      blocks = {};
-      const br = db.tables?.BLOCK_RECORD?.entries || [];
-      for (const b of br) {
-        if (b.name && b.entities) blocks[b.name] = b.entities;
-      }
-
-      entities = db.entities || [];
-
-      // Если в Модели пусто, пробуем взять из Листа (Paper Space)
-      if (!entities.length && blocks['*Paper_Space']?.length) {
-        entities = blocks['*Paper_Space'];
-      }
-
-      if (!entities.length) {
-        statusEl.textContent = `Пусто (0 эл., блоков: ${Object.keys(blocks).length})`;
-        bounds = null;
-        draw();
-        return;
-      }
-
-      const counts = {};
-      for (const ent of entities) counts[ent.type] = (counts[ent.type] || 0) + 1;
-      const top = Object.entries(counts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-        .map(([k, v]) => `${k}:${v}`)
-        .join(' ');
-
-      calcBounds();
-      fitToScreen();
-      statusEl.textContent = `${entities.length} эл. | ${top}`;
-    } catch (err) {
-      statusEl.textContent = `Сбой (${sizeMB} МБ): ${err.message || err}`;
-      console.error(err);
-    }
-  });
+  function tx(m, x, y) {
+    return [m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]];
+  }
 
   function walkEntities(list, fn, depth = 0, m = [1, 0, 0, 1, 0, 0]) {
     if (depth > 8 || !list) return;
     for (const e of list) {
-      // Раскрываем и обычные блоки INSERT, и блоки размеров DIMENSION
-      if (e.type === 'INSERT' && e.name && blocks[e.name]) {
+      const bName = e.name || e.blockName;
+      if (e.type === 'INSERT' && bName && blocks[bName]) {
         const ip = e.insertionPoint || { x: 0, y: 0 };
         const sx = e.xScale ?? 1, sy = e.yScale ?? 1;
         const rot = e.rotation || 0;
@@ -159,25 +115,27 @@
           m[0]*ip.x + m[2]*ip.y + m[4],
           m[1]*ip.x + m[3]*ip.y + m[5]
         ];
-        walkEntities(blocks[e.name], fn, depth + 1, nm);
-      } else if (e.type === 'DIMENSION' && e.name && blocks[e.name]) {
-        // Размеры в DWG почти всегда хранят свою геометрию и цифры в скрытом блоке *D...
-        walkEntities(blocks[e.name], fn, depth + 1, m);
+        walkEntities(blocks[bName], fn, depth + 1, nm);
+      } else if (e.type === 'DIMENSION') {
+        if (bName && blocks[bName]) {
+          walkEntities(blocks[bName], fn, depth + 1, m);
+        } else {
+          fn(e, m);
+        }
       } else {
         fn(e, m);
       }
     }
   }
 
-  function tx(m, x, y) {
-    return [m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]];
-  }
-
-  function calcBounds() {
+  // Запекаем всю геометрию в один Path2D и собираем тексты один раз при загрузке
+  function bakeGeometry(entities) {
+    const path = new Path2D();
+    const texts = [];
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    const add = (m, x, y) => {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-      const [px, py] = tx(m, x, y);
+
+    const addBound = (px, py) => {
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return;
       if (Math.abs(px) > 1e8 || Math.abs(py) > 1e8) return;
       if (px < minX) minX = px;
       if (py < minY) minY = py;
@@ -187,85 +145,52 @@
 
     walkEntities(entities, (e, m) => {
       if (e.type === 'LINE' && e.startPoint && e.endPoint) {
-        add(m, e.startPoint.x, e.startPoint.y);
-        add(m, e.endPoint.x, e.endPoint.y);
-      } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices) {
-        for (const v of e.vertices) add(m, v.x, v.y);
-      } else if ((e.type === 'CIRCLE' || e.type === 'ARC') && e.center) {
-        add(m, e.center.x - e.radius, e.center.y - e.radius);
-        add(m, e.center.x + e.radius, e.center.y + e.radius);
-      } else if (e.type === 'SPLINE') {
-        const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
-        if (pts) for (const p of pts) add(m, p.x, p.y);
-      } else if (e.type === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
-        const r = Math.hypot(e.majorAxisEndPoint.x, e.majorAxisEndPoint.y);
-        add(m, e.center.x - r, e.center.y - r);
-        add(m, e.center.x + r, e.center.y + r);
-      }
-    });
-    bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
-  }
-
-  function fitToScreen() {
-    if (!bounds) return;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    const bw = bounds.maxX - bounds.minX || 1;
-    const bh = bounds.maxY - bounds.minY || 1;
-    scale = Math.min(w / bw, h / bh) * 0.9;
-    offsetX = w / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
-    offsetY = h / 2 + ((bounds.minY + bounds.maxY) / 2) * scale;
-    draw();
-  }
-  fitBtn.addEventListener('click', fitToScreen);
-
-  function draw() {
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    ctx.clearRect(0, 0, w, h);
-    if (!entities.length) return;
-
-    const texts = [];
-
-    ctx.save();
-    ctx.translate(offsetX, offsetY);
-    ctx.scale(scale, -scale);
-    ctx.strokeStyle = '#e0e0e0';
-    ctx.lineWidth = 1 / scale;
-
-    ctx.beginPath();
-    walkEntities(entities, (e, m) => {
-      if (e.type === 'LINE' && e.startPoint && e.endPoint) {
         const [x1, y1] = tx(m, e.startPoint.x, e.startPoint.y);
         const [x2, y2] = tx(m, e.endPoint.x, e.endPoint.y);
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
+        path.moveTo(x1, y1);
+        path.lineTo(x2, y2);
+        addBound(x1, y1);
+        addBound(x2, y2);
       } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices?.length > 1) {
         const [x0, y0] = tx(m, e.vertices[0].x, e.vertices[0].y);
-        ctx.moveTo(x0, y0);
+        path.moveTo(x0, y0);
+        addBound(x0, y0);
         for (let i = 1; i < e.vertices.length; i++) {
           const [xi, yi] = tx(m, e.vertices[i].x, e.vertices[i].y);
-          ctx.lineTo(xi, yi);
+          path.lineTo(xi, yi);
+          addBound(xi, yi);
         }
-        if (e.flag & 1) ctx.lineTo(x0, y0);
+        if (e.flag & 1) path.lineTo(x0, y0);
       } else if (e.type === 'CIRCLE' && e.center) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
-        ctx.moveTo(cx + r, cy);
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        if (r > 0 && Number.isFinite(r)) {
+          path.moveTo(cx + r, cy);
+          path.arc(cx, cy, r, 0, Math.PI * 2);
+          addBound(cx - r, cy - r);
+          addBound(cx + r, cy + r);
+        }
       } else if (e.type === 'ARC' && e.center) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
-        const sx = cx + Math.cos(e.startAngle) * r;
-        const sy = cy + Math.sin(e.startAngle) * r;
-        ctx.moveTo(sx, sy);
-        ctx.arc(cx, cy, r, e.startAngle, e.endAngle);
+        if (r > 0 && Number.isFinite(r)) {
+          const sx = cx + Math.cos(e.startAngle) * r;
+          const sy = cy + Math.sin(e.startAngle) * r;
+          path.moveTo(sx, sy);
+          path.arc(cx, cy, r, e.startAngle, e.endAngle);
+          addBound(cx - r, cy - r);
+          addBound(cx + r, cy + r);
+        }
       } else if (e.type === 'SPLINE') {
         const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
         if (pts && pts.length > 1) {
           const [x0, y0] = tx(m, pts[0].x, pts[0].y);
-          ctx.moveTo(x0, y0);
+          path.moveTo(x0, y0);
+          addBound(x0, y0);
           for (let i = 1; i < pts.length; i++) {
             const [xi, yi] = tx(m, pts[i].x, pts[i].y);
-            ctx.lineTo(xi, yi);
+            path.lineTo(xi, yi);
+            addBound(xi, yi);
           }
         }
       } else if (e.type === 'ELLIPSE' && e.center && e.majorAxisEndPoint) {
@@ -276,14 +201,29 @@
         const rot = Math.atan2(e.majorAxisEndPoint.y, e.majorAxisEndPoint.x);
         const start = e.startAngle ?? 0;
         const end = e.endAngle ?? Math.PI * 2;
-        ctx.moveTo(
-          cx + rx * Math.cos(start) * Math.cos(rot) - ry * Math.sin(start) * Math.sin(rot),
-          cy + rx * Math.cos(start) * Math.sin(rot) + ry * Math.sin(start) * Math.cos(rot)
-        );
-        ctx.ellipse(cx, cy, rx, ry, rot, start, end);
-      } else if (e.type === 'TEXT' || e.type === 'MTEXT') {
-        const pt = e.startPoint || e.insertionPoint || e.position;
-        const str = cleanText(e.text);
+        if (rx > 0 && ry > 0) {
+          path.moveTo(
+            cx + rx * Math.cos(start) * Math.cos(rot) - ry * Math.sin(start) * Math.sin(rot),
+            cy + rx * Math.cos(start) * Math.sin(rot) + ry * Math.sin(start) * Math.cos(rot)
+          );
+          path.ellipse(cx, cy, rx, ry, rot, start, end);
+          addBound(cx - rx, cy - rx);
+          addBound(cx + rx, cy + rx);
+        }
+      } else if (e.type === 'TEXT' || e.type === 'MTEXT' || e.type === 'ATTRIB' || e.type === 'ATTDEF') {
+        const pt = e.startPoint || e.insertionPoint || e.position || e.alignmentPoint;
+        const str = cleanText(e.text ?? e.textString ?? e.contents);
+        if (pt && str) {
+          const [px, py] = tx(m, pt.x, pt.y);
+          const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
+          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0 });
+        }
+      } else if (e.type === 'DIMENSION') {
+        const pt = e.textPoint || e.middleOfText || e.definitionPoint;
+        let str = cleanText(e.text ?? e.textString);
+        if (!str || str === '<>') {
+          if (Number.isFinite(e.measurement)) str = String(Math.round(e.measurement));
+        }
         if (pt && str) {
           const [px, py] = tx(m, pt.x, pt.y);
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
@@ -291,14 +231,94 @@
         }
       }
     });
-    ctx.stroke();
+
+    bakedPath = path;
+    bakedTexts = texts;
+    bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
+  }
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file || !libredwg) return;
+
+    const sizeMB = (file.size / 1024 / 1024).toFixed(1);
+    statusEl.textContent = `Читаю (${sizeMB} МБ)...`;
+    await new Promise(r => setTimeout(r, 30));
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const dwg = libredwg.dwg_read_data(new Uint8Array(buffer), Dwg_File_Type.DWG);
+      if (!dwg) {
+        statusEl.textContent = `Не прочитан (${sizeMB} МБ): новая версия DWG`;
+        return;
+      }
+
+      const db = libredwg.convert(dwg);
+      libredwg.dwg_free(dwg);
+
+      blocks = {};
+      const br = db.tables?.BLOCK_RECORD?.entries || [];
+      for (const b of br) {
+        if (b.name && b.entities) blocks[b.name] = b.entities;
+      }
+
+      let entities = db.entities || [];
+      if (!entities.length && blocks['*Paper_Space']?.length) {
+        entities = blocks['*Paper_Space'];
+      }
+
+      if (!entities.length) {
+        bakedPath = null;
+        bakedTexts = [];
+        bounds = null;
+        statusEl.textContent = `Пусто (0 эл., блоков: ${Object.keys(blocks).length})`;
+        requestDraw();
+        return;
+      }
+
+      statusEl.textContent = `Сборка (${entities.length} эл.)...`;
+      await new Promise(r => setTimeout(r, 15));
+
+      bakeGeometry(entities);
+      fitToScreen();
+      statusEl.textContent = `${entities.length} эл. | текстов: ${bakedTexts.length}`;
+    } catch (err) {
+      statusEl.textContent = `Сбой (${sizeMB} МБ): ${err.message || err}`;
+      console.error(err);
+    }
+  });
+
+  function fitToScreen() {
+    if (!bounds) return;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const bw = bounds.maxX - bounds.minX || 1;
+    const bh = bounds.maxY - bounds.minY || 1;
+    scale = Math.min(w / bw, h / bh) * 0.9;
+    offsetX = w / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
+    offsetY = h / 2 + ((bounds.minY + bounds.maxY) / 2) * scale;
+    requestDraw();
+  }
+  fitBtn.addEventListener('click', fitToScreen);
+
+  function draw() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+    if (!bakedPath) return;
+
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, -scale);
+    ctx.strokeStyle = '#e0e0e0';
+    ctx.lineWidth = 1 / scale;
+    ctx.stroke(bakedPath);
     ctx.restore();
 
-    // Рисуем текст и цифры размеров (только если они крупнее 4 пикселей на экране)
+    if (!bakedTexts.length) return;
     ctx.fillStyle = '#ffd54f';
-    for (const t of texts) {
+    for (let i = 0; i < bakedTexts.length; i++) {
+      const t = bakedTexts[i];
       const pxH = t.h * scale;
-      if (pxH < 4) continue;
+      if (pxH < 5) continue;
       const sx = offsetX + t.x * scale;
       const sy = offsetY - t.y * scale;
       if (sx < -200 || sx > w + 200 || sy < -50 || sy > h + 50) continue;
@@ -334,7 +354,7 @@
     if (pointers.size === 1) {
       offsetX += curr.x - prev.x;
       offsetY += curr.y - prev.y;
-      draw();
+      requestDraw();
     } else if (pointers.size === 2) {
       const [p1, p2] = [...pointers.values()];
       const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
@@ -344,7 +364,7 @@
         offsetX = center.x - (center.x - offsetX) * factor + (center.x - lastCenter.x);
         offsetY = center.y - (center.y - offsetY) * factor + (center.y - lastCenter.y);
         scale *= factor;
-        draw();
+        requestDraw();
       }
       lastDist = dist;
       lastCenter = center;
@@ -363,8 +383,9 @@
     offsetX = mx - (mx - offsetX) * factor;
     offsetY = my - (my - offsetY) * factor;
     scale *= factor;
-    draw();
+    requestDraw();
   }, { passive: false });
 </script>
 </body>
 </html>
+
