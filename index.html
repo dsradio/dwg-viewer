@@ -7,11 +7,12 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
     body { background: #141414; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
-    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    header { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
+    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 11px; border-radius: 6px; font-size: 13px; cursor: pointer; white-space: nowrap; }
     .btn:active { background: #444; }
     .btn-primary { background: #e65100; border-color: #ff6d00; font-weight: 600; }
-    #status { margin-left: auto; font-size: 11px; color: #bbb; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .btn-active { background: #2e7d32; border-color: #4caf50; font-weight: 600; }
+    #status { margin-left: auto; font-size: 11px; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     canvas { flex: 1; width: 100%; height: 100%; touch-action: none; display: block; }
     input[type="file"] { display: none; }
   </style>
@@ -20,11 +21,12 @@
 
 <header>
   <label class="btn btn-primary">
-    Открыть DWG
+    DWG
     <input type="file" id="fileInput" accept=".dwg">
   </label>
   <button class="btn" id="fitBtn">Вписать</button>
-  <div id="status">Загрузка движка...</div>
+  <button class="btn" id="rulerBtn">Линейка</button>
+  <div id="status">Загрузка...</div>
 </header>
 
 <canvas id="canvas"></canvas>
@@ -37,17 +39,55 @@
   const statusEl = document.getElementById('status');
   const fileInput = document.getElementById('fileInput');
   const fitBtn = document.getElementById('fitBtn');
+  const rulerBtn = document.getElementById('rulerBtn');
 
   let libredwg = null;
   let blocks = {};
-  let bakedPath = null;
+  let layers = {};
+  let bakedPaths = new Map(); // color -> Path2D
   let bakedTexts = [];
+  let snapPoints = []; // [x1, y1, x2, y2, ...]
   let bounds = null;
 
   let scale = 1, offsetX = 0, offsetY = 0;
   let rafId = null;
 
-  // Инициализация WASM
+  // Линейка
+  let measureMode = false;
+  let measurePts = []; // [{x, y, snapped}]
+
+  // Базовая палитра AutoCAD (ACI)
+  const ACI = {
+    1: '#ff3b30', 2: '#ffd60a', 3: '#34c759', 4: '#32ade6',
+    5: '#0a84ff', 6: '#ff2d55', 7: '#e5e5e5', 8: '#8e8e93', 9: '#c7c7cc',
+    10: '#ff3b30', 30: '#ff9500', 40: '#ffcc00', 50: '#a8e61d',
+    90: '#30d158', 130: '#5ac8fa', 150: '#007aff', 170: '#5856d6',
+    210: '#af52de', 230: '#ff2d55', 250: '#48484a', 251: '#636366',
+    252: '#8e8e93', 253: '#aeaeb2', 254: '#d1d1d6', 255: '#ffffff'
+  };
+
+  function aciToHex(idx) {
+    const i = Math.abs(idx || 7);
+    if (ACI[i]) return ACI[i];
+    if (i >= 10 && i <= 249) {
+      const hue = Math.round(((i - 10) / 240) * 360);
+      return `hsl(${hue}, 80%, 60%)`;
+    }
+    return '#e5e5e5';
+  }
+
+  function resolveColor(e, parentColor = '#e5e5e5') {
+    if (e.color && typeof e.color === 'number' && e.color > 0) {
+      return '#' + (e.color & 0xffffff).toString(16).padStart(6, '0');
+    }
+    const ci = e.colorIndex;
+    if (ci === 0) return parentColor; // ByBlock
+    if (ci !== undefined && ci !== null && ci !== 256) return aciToHex(ci);
+    // ByLayer
+    const lColor = layers[e.layer];
+    return lColor || parentColor;
+  }
+
   (async () => {
     const urls = [
       'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/wasm',
@@ -61,7 +101,7 @@
         return;
       } catch (e) {}
     }
-    statusEl.textContent = 'Ошибка загрузки WASM';
+    statusEl.textContent = 'Ошибка WASM';
   })();
 
   function requestDraw() {
@@ -82,6 +122,14 @@
   window.addEventListener('resize', resize);
   resize();
 
+  rulerBtn.addEventListener('click', () => {
+    measureMode = !measureMode;
+    measurePts = [];
+    rulerBtn.classList.toggle('btn-active', measureMode);
+    statusEl.textContent = measureMode ? 'Ткни в 2 точки' : 'Готов';
+    requestDraw();
+  });
+
   function cleanText(raw) {
     if (raw === undefined || raw === null) return '';
     return String(raw)
@@ -98,9 +146,10 @@
     return [m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]];
   }
 
-  function walkEntities(list, fn, depth = 0, m = [1, 0, 0, 1, 0, 0]) {
+  function walkEntities(list, fn, depth = 0, m = [1, 0, 0, 1, 0, 0], parentColor = '#e5e5e5') {
     if (depth > 8 || !list) return;
     for (const e of list) {
+      const col = resolveColor(e, parentColor);
       const bName = e.name || e.blockName;
       if (e.type === 'INSERT' && bName && blocks[bName]) {
         const ip = e.insertionPoint || { x: 0, y: 0 };
@@ -115,58 +164,71 @@
           m[0]*ip.x + m[2]*ip.y + m[4],
           m[1]*ip.x + m[3]*ip.y + m[5]
         ];
-        walkEntities(blocks[bName], fn, depth + 1, nm);
+        walkEntities(blocks[bName], fn, depth + 1, nm, col);
       } else if (e.type === 'DIMENSION') {
         if (bName && blocks[bName]) {
-          walkEntities(blocks[bName], fn, depth + 1, m);
+          walkEntities(blocks[bName], fn, depth + 1, m, col);
         } else {
-          fn(e, m);
+          fn(e, m, col);
         }
       } else {
-        fn(e, m);
+        fn(e, m, col);
       }
     }
   }
 
-  // Запекаем всю геометрию в один Path2D и собираем тексты один раз при загрузке
   function bakeGeometry(entities) {
-    const path = new Path2D();
+    const paths = new Map();
     const texts = [];
+    const snaps = [];
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
-    const addBound = (px, py) => {
+    const getPath = (col) => {
+      let p = paths.get(col);
+      if (!p) { p = new Path2D(); paths.set(col, p); }
+      return p;
+    };
+
+    const addBound = (px, py, isSnap = false) => {
       if (!Number.isFinite(px) || !Number.isFinite(py)) return;
       if (Math.abs(px) > 1e8 || Math.abs(py) > 1e8) return;
       if (px < minX) minX = px;
       if (py < minY) minY = py;
       if (px > maxX) maxX = px;
       if (py > maxY) maxY = py;
+      if (isSnap && snaps.length < 120000) {
+        snaps.push(px, py);
+      }
     };
 
-    walkEntities(entities, (e, m) => {
+    walkEntities(entities, (e, m, col) => {
       if (e.type === 'LINE' && e.startPoint && e.endPoint) {
         const [x1, y1] = tx(m, e.startPoint.x, e.startPoint.y);
         const [x2, y2] = tx(m, e.endPoint.x, e.endPoint.y);
-        path.moveTo(x1, y1);
-        path.lineTo(x2, y2);
-        addBound(x1, y1);
-        addBound(x2, y2);
+        const p = getPath(col);
+        p.moveTo(x1, y1);
+        p.lineTo(x2, y2);
+        addBound(x1, y1, true);
+        addBound(x2, y2, true);
       } else if ((e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') && e.vertices?.length > 1) {
+        const p = getPath(col);
         const [x0, y0] = tx(m, e.vertices[0].x, e.vertices[0].y);
-        path.moveTo(x0, y0);
-        addBound(x0, y0);
+        p.moveTo(x0, y0);
+        addBound(x0, y0, true);
         for (let i = 1; i < e.vertices.length; i++) {
           const [xi, yi] = tx(m, e.vertices[i].x, e.vertices[i].y);
-          path.lineTo(xi, yi);
-          addBound(xi, yi);
+          p.lineTo(xi, yi);
+          addBound(xi, yi, true);
         }
-        if (e.flag & 1) path.lineTo(x0, y0);
+        if (e.flag & 1) p.lineTo(x0, y0);
       } else if (e.type === 'CIRCLE' && e.center) {
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
         if (r > 0 && Number.isFinite(r)) {
-          path.moveTo(cx + r, cy);
-          path.arc(cx, cy, r, 0, Math.PI * 2);
+          const p = getPath(col);
+          p.moveTo(cx + r, cy);
+          p.arc(cx, cy, r, 0, Math.PI * 2);
+          addBound(cx, cy, true);
           addBound(cx - r, cy - r);
           addBound(cx + r, cy + r);
         }
@@ -174,22 +236,24 @@
         const [cx, cy] = tx(m, e.center.x, e.center.y);
         const r = e.radius * Math.hypot(m[0], m[1]);
         if (r > 0 && Number.isFinite(r)) {
+          const p = getPath(col);
           const sx = cx + Math.cos(e.startAngle) * r;
           const sy = cy + Math.sin(e.startAngle) * r;
-          path.moveTo(sx, sy);
-          path.arc(cx, cy, r, e.startAngle, e.endAngle);
-          addBound(cx - r, cy - r);
-          addBound(cx + r, cy + r);
+          p.moveTo(sx, sy);
+          p.arc(cx, cy, r, e.startAngle, e.endAngle);
+          addBound(cx, cy, true);
+          addBound(sx, sy, true);
         }
       } else if (e.type === 'SPLINE') {
         const pts = e.fitPoints?.length ? e.fitPoints : e.controlPoints;
         if (pts && pts.length > 1) {
+          const p = getPath(col);
           const [x0, y0] = tx(m, pts[0].x, pts[0].y);
-          path.moveTo(x0, y0);
-          addBound(x0, y0);
+          p.moveTo(x0, y0);
+          addBound(x0, y0, true);
           for (let i = 1; i < pts.length; i++) {
             const [xi, yi] = tx(m, pts[i].x, pts[i].y);
-            path.lineTo(xi, yi);
+            p.lineTo(xi, yi);
             addBound(xi, yi);
           }
         }
@@ -202,13 +266,13 @@
         const start = e.startAngle ?? 0;
         const end = e.endAngle ?? Math.PI * 2;
         if (rx > 0 && ry > 0) {
-          path.moveTo(
+          const p = getPath(col);
+          p.moveTo(
             cx + rx * Math.cos(start) * Math.cos(rot) - ry * Math.sin(start) * Math.sin(rot),
             cy + rx * Math.cos(start) * Math.sin(rot) + ry * Math.sin(start) * Math.cos(rot)
           );
-          path.ellipse(cx, cy, rx, ry, rot, start, end);
-          addBound(cx - rx, cy - rx);
-          addBound(cx + rx, cy + rx);
+          p.ellipse(cx, cy, rx, ry, rot, start, end);
+          addBound(cx, cy, true);
         }
       } else if (e.type === 'TEXT' || e.type === 'MTEXT' || e.type === 'ATTRIB' || e.type === 'ATTDEF') {
         const pt = e.startPoint || e.insertionPoint || e.position || e.alignmentPoint;
@@ -216,7 +280,7 @@
         if (pt && str) {
           const [px, py] = tx(m, pt.x, pt.y);
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
-          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0 });
+          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0, col });
         }
       } else if (e.type === 'DIMENSION') {
         const pt = e.textPoint || e.middleOfText || e.definitionPoint;
@@ -227,13 +291,14 @@
         if (pt && str) {
           const [px, py] = tx(m, pt.x, pt.y);
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
-          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0 });
+          texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0, col });
         }
       }
     });
 
-    bakedPath = path;
+    bakedPaths = paths;
     bakedTexts = texts;
+    snapPoints = snaps;
     bounds = minX < Infinity ? { minX, minY, maxX, maxY } : null;
   }
 
@@ -249,12 +314,23 @@
       const buffer = await file.arrayBuffer();
       const dwg = libredwg.dwg_read_data(new Uint8Array(buffer), Dwg_File_Type.DWG);
       if (!dwg) {
-        statusEl.textContent = `Не прочитан (${sizeMB} МБ): новая версия DWG`;
+        statusEl.textContent = `Не прочитан (${sizeMB} МБ)`;
         return;
       }
 
       const db = libredwg.convert(dwg);
       libredwg.dwg_free(dwg);
+
+      layers = {};
+      const layerEntries = db.tables?.LAYER?.entries || [];
+      for (const l of layerEntries) {
+        if (!l.name) continue;
+        if (l.color && typeof l.color === 'number' && l.color > 0) {
+          layers[l.name] = '#' + (l.color & 0xffffff).toString(16).padStart(6, '0');
+        } else {
+          layers[l.name] = aciToHex(l.colorIndex ?? 7);
+        }
+      }
 
       blocks = {};
       const br = db.tables?.BLOCK_RECORD?.entries || [];
@@ -267,11 +343,13 @@
         entities = blocks['*Paper_Space'];
       }
 
+      measurePts = [];
       if (!entities.length) {
-        bakedPath = null;
+        bakedPaths.clear();
         bakedTexts = [];
+        snapPoints = [];
         bounds = null;
-        statusEl.textContent = `Пусто (0 эл., блоков: ${Object.keys(blocks).length})`;
+        statusEl.textContent = 'Пусто (0 эл.)';
         requestDraw();
         return;
       }
@@ -281,9 +359,9 @@
 
       bakeGeometry(entities);
       fitToScreen();
-      statusEl.textContent = `${entities.length} эл. | текстов: ${bakedTexts.length}`;
+      statusEl.textContent = `${entities.length} эл. | цветов: ${bakedPaths.size}`;
     } catch (err) {
-      statusEl.textContent = `Сбой (${sizeMB} МБ): ${err.message || err}`;
+      statusEl.textContent = `Сбой: ${err.message || err}`;
       console.error(err);
     }
   });
@@ -300,21 +378,46 @@
   }
   fitBtn.addEventListener('click', fitToScreen);
 
+  function screenToWorld(sx, sy) {
+    return [(sx - offsetX) / scale, (offsetY - sy) / scale];
+  }
+
+  function findSnap(sx, sy) {
+    const radiusSq = 28 * 28; // радиус привязки 28 пикселей
+    let bestDist = radiusSq;
+    let bestPt = null;
+    for (let i = 0; i < snapPoints.length; i += 2) {
+      const wx = snapPoints[i], wy = snapPoints[i + 1];
+      const px = offsetX + wx * scale;
+      const py = offsetY - wy * scale;
+      const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
+      if (d < bestDist) {
+        bestDist = d;
+        bestPt = { x: wx, y: wy, snapped: true };
+      }
+    }
+    if (bestPt) return bestPt;
+    const [wx, wy] = screenToWorld(sx, sy);
+    return { x: wx, y: wy, snapped: false };
+  }
+
   function draw() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
-    if (!bakedPath) return;
 
-    ctx.save();
-    ctx.translate(offsetX, offsetY);
-    ctx.scale(scale, -scale);
-    ctx.strokeStyle = '#e0e0e0';
-    ctx.lineWidth = 1 / scale;
-    ctx.stroke(bakedPath);
-    ctx.restore();
+    if (bakedPaths.size) {
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, -scale);
+      ctx.lineWidth = 1 / scale;
+      for (const [col, path] of bakedPaths) {
+        ctx.strokeStyle = col;
+        ctx.stroke(path);
+      }
+      ctx.restore();
+    }
 
-    if (!bakedTexts.length) return;
-    ctx.fillStyle = '#ffd54f';
+    // Текст и размеры
     for (let i = 0; i < bakedTexts.length; i++) {
       const t = bakedTexts[i];
       const pxH = t.h * scale;
@@ -326,19 +429,70 @@
       ctx.save();
       ctx.translate(sx, sy);
       if (t.rot) ctx.rotate(-t.rot);
+      ctx.fillStyle = t.col || '#ffd54f';
       ctx.font = `${Math.min(pxH, 60)}px sans-serif`;
       ctx.fillText(t.str, 0, 0);
       ctx.restore();
+    }
+
+    // Отрисовка линейки
+    if (measurePts.length) {
+      const ptsScreen = measurePts.map(p => ({
+        sx: offsetX + p.x * scale,
+        sy: offsetY - p.y * scale,
+        snapped: p.snapped
+      }));
+
+      if (ptsScreen.length === 2) {
+        const [a, b] = ptsScreen;
+        ctx.save();
+        ctx.strokeStyle = '#00e676';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(a.sx, a.sy);
+        ctx.lineTo(b.sx, b.sy);
+        ctx.stroke();
+        ctx.restore();
+
+        const dist = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
+        const label = dist >= 1000 ? `${dist.toFixed(0)} (${(dist / 1000).toFixed(2)} м)` : dist.toFixed(1);
+        const mx = (a.sx + b.sx) / 2;
+        const my = (a.sy + b.sy) / 2 - 14;
+
+        ctx.save();
+        ctx.font = 'bold 14px system-ui, sans-serif';
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(mx - tw / 2 - 6, my - 15, tw + 12, 22);
+        ctx.fillStyle = '#00e676';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, mx, my);
+        ctx.restore();
+      }
+
+      for (const p of ptsScreen) {
+        ctx.save();
+        ctx.strokeStyle = p.snapped ? '#00e676' : '#ff9100';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(p.sx - 6, p.sy - 6, 12, 12);
+        ctx.restore();
+      }
     }
   }
 
   // Управление: тач и мышь
   let pointers = new Map(), lastDist = 0, lastCenter = null;
+  let downPos = null, moved = false;
 
   canvas.addEventListener('pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pointers.size === 2) {
+    if (pointers.size === 1) {
+      downPos = { x: e.clientX, y: e.clientY };
+      moved = false;
+    } else if (pointers.size === 2) {
+      moved = true;
       const [p1, p2] = [...pointers.values()];
       lastDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
       lastCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
@@ -352,6 +506,7 @@
     pointers.set(e.pointerId, curr);
 
     if (pointers.size === 1) {
+      if (downPos && Math.hypot(curr.x - downPos.x, curr.y - downPos.y) > 8) moved = true;
       offsetX += curr.x - prev.x;
       offsetY += curr.y - prev.y;
       requestDraw();
@@ -371,7 +526,24 @@
     }
   });
 
-  const endPointer = (e) => { pointers.delete(e.pointerId); lastDist = 0; };
+  const endPointer = (e) => {
+    if (measureMode && !moved && pointers.size === 1) {
+      const rect = canvas.getBoundingClientRect();
+      const pt = findSnap(e.clientX - rect.left, e.clientY - rect.top);
+      if (measurePts.length >= 2) measurePts = [pt];
+      else measurePts.push(pt);
+
+      if (measurePts.length === 2) {
+        const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
+        statusEl.textContent = `Замер: ${d.toFixed(1)}`;
+      } else {
+        statusEl.textContent = pt.snapped ? 'Точка 1 (привязка)' : 'Точка 1';
+      }
+      requestDraw();
+    }
+    pointers.delete(e.pointerId);
+    lastDist = 0;
+  };
   canvas.addEventListener('pointerup', endPointer);
   canvas.addEventListener('pointercancel', endPointer);
 
@@ -388,4 +560,3 @@
 </script>
 </body>
 </html>
-
