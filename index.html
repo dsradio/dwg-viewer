@@ -3,18 +3,41 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#202020">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.json">
   <title>DWG Viewer</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
     body { background: #141414; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
-    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 8px 11px; border-radius: 6px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+    header { display: flex; align-items: center; gap: 5px; padding: 7px 8px; background: #202020; border-bottom: 1px solid #333; z-index: 10; }
+    .btn { background: #2e2e2e; color: #fff; border: 1px solid #444; padding: 7px 9px; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
     .btn:active { background: #444; }
     .btn-primary { background: #e65100; border-color: #ff6d00; font-weight: 600; }
     .btn-active { background: #2e7d32; border-color: #4caf50; font-weight: 600; }
-    #status { margin-left: auto; font-size: 11px; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #status { margin-left: auto; font-size: 11px; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34%; }
     canvas { flex: 1; width: 100%; height: 100%; touch-action: none; display: block; }
     input[type="file"] { display: none; }
+
+    #panel {
+      display: none; position: fixed; left: 8px; right: 8px; bottom: 10px;
+      background: rgba(26, 26, 26, 0.96); border: 1px solid #444; border-radius: 10px;
+      padding: 10px; z-index: 20; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.6);
+    }
+    #panel.open { display: block; }
+    .panel-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .panel-info { font-size: 13px; font-weight: 600; color: #00e676; margin-bottom: 6px; }
+    .panel-input {
+      width: 72px; background: #141414; color: #fff; border: 1px solid #555;
+      border-radius: 5px; padding: 5px 7px; font-size: 13px;
+    }
+    .stakes-box {
+      margin-top: 8px; max-height: 110px; overflow-y: auto;
+      background: #121212; border: 1px solid #2c2c2c; border-radius: 6px;
+      padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 11px; color: #ddd;
+      line-height: 1.45;
+    }
   </style>
 </head>
 <body>
@@ -26,10 +49,33 @@
   </label>
   <button class="btn" id="fitBtn">Центровать</button>
   <button class="btn" id="rulerBtn">Линейка</button>
+  <button class="btn" id="areaBtn">Площадь</button>
+  <button class="btn" id="arcBtn">Дуга</button>
   <div id="status">Загрузка...</div>
 </header>
 
 <canvas id="canvas"></canvas>
+
+<div id="panel">
+  <div id="panelInfo" class="panel-info"></div>
+  <div id="areaControls" class="panel-row" style="display:none;">
+    <button class="btn" id="undoPtBtn">Назад</button>
+    <button class="btn" id="clearToolBtn">Сброс</button>
+    <label style="margin-left:auto; display:flex; align-items:center; gap:5px; color:#ccc;">
+      H (м):
+      <input type="number" id="heightInput" class="panel-input" step="0.01" min="0" placeholder="0.20">
+    </label>
+  </div>
+  <div id="arcControls" class="panel-row" style="display:none;">
+    <button class="btn" id="arcClearBtn">Сброс</button>
+    <label style="display:flex; align-items:center; gap:4px; color:#ccc;">
+      Шаг (м):
+      <input type="number" id="stepInput" class="panel-input" style="width:64px;" step="0.1" min="0.1" value="0.5">
+    </label>
+    <span id="arcHint" style="color:#aaa; margin-left:auto;">1: начало, 2: изгиб, 3: конец</span>
+  </div>
+  <div id="stakesBox" class="stakes-box" style="display:none;"></div>
+</div>
 
 <script type="module">
   import { LibreDwg, Dwg_File_Type } from 'https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web/dist/libredwg-web.js';
@@ -40,23 +86,37 @@
   const fileInput = document.getElementById('fileInput');
   const fitBtn = document.getElementById('fitBtn');
   const rulerBtn = document.getElementById('rulerBtn');
+  const areaBtn = document.getElementById('areaBtn');
+  const arcBtn = document.getElementById('arcBtn');
+
+  const panel = document.getElementById('panel');
+  const panelInfo = document.getElementById('panelInfo');
+  const areaControls = document.getElementById('areaControls');
+  const arcControls = document.getElementById('arcControls');
+  const heightInput = document.getElementById('heightInput');
+  const stepInput = document.getElementById('stepInput');
+  const stakesBox = document.getElementById('stakesBox');
+  const arcHint = document.getElementById('arcHint');
 
   let libredwg = null;
   let blocks = {};
   let layers = {};
   let bakedPaths = new Map();
   let bakedTexts = [];
-  let snapPoints = [];   // [x, y, ...] углы, концы, центры
-  let snapSegments = []; // [x1, y1, x2, y2, ...] отрезки для примагничивания к самой линии
+  let snapPoints = [];
+  let snapSegments = [];
   let bounds = null;
 
   let scale = 1, offsetX = 0, offsetY = 0;
   let rafId = null;
 
-  // Линейка и лупа
-  let measureMode = false;
-  let measurePts = []; // [{x, y, snapType: 'point'|'line'|null}]
+  // Режимы: null | 'ruler' | 'area' | 'arc'
+  let toolMode = null;
+  let measurePts = [];
+  let areaPts = [];
+  let arcPts = [];
   let activeDragIdx = null;
+  let activeDragList = null; // 'measure' | 'area' | 'arc'
 
   const ACI = {
     1: '#ff3b30', 2: '#ffd60a', 3: '#34c759', 4: '#32ade6',
@@ -121,20 +181,191 @@
   window.addEventListener('resize', resize);
   resize();
 
-  rulerBtn.addEventListener('click', () => {
-    measureMode = !measureMode;
+  function setTool(nextMode) {
     activeDragIdx = null;
-    rulerBtn.classList.toggle('btn-active', measureMode);
-    if (measureMode) {
+    activeDragList = null;
+    toolMode = toolMode === nextMode ? null : nextMode;
+
+    rulerBtn.classList.toggle('btn-active', toolMode === 'ruler');
+    areaBtn.classList.toggle('btn-active', toolMode === 'area');
+    arcBtn.classList.toggle('btn-active', toolMode === 'arc');
+
+    panel.classList.toggle('open', toolMode === 'area' || toolMode === 'arc');
+    areaControls.style.display = toolMode === 'area' ? 'flex' : 'none';
+    arcControls.style.display = toolMode === 'arc' ? 'flex' : 'none';
+    stakesBox.style.display = 'none';
+
+    if (toolMode === 'ruler') {
       const pt = findSnap(canvas.clientWidth / 2, canvas.clientHeight / 2);
       measurePts = [pt];
       statusEl.textContent = 'Тащи точку 1';
+    } else if (toolMode === 'area') {
+      areaPts = [];
+      updateAreaPanel();
+      statusEl.textContent = 'Тапай контур';
+    } else if (toolMode === 'arc') {
+      arcPts = [];
+      updateArcPanel();
+      statusEl.textContent = 'Дуга: 3 точки';
     } else {
-      measurePts = [];
       statusEl.textContent = 'Готов';
     }
     requestDraw();
+  }
+
+  rulerBtn.addEventListener('click', () => setTool('ruler'));
+  areaBtn.addEventListener('click', () => setTool('area'));
+  arcBtn.addEventListener('click', () => setTool('arc'));
+
+  document.getElementById('undoPtBtn').addEventListener('click', () => {
+    areaPts.pop();
+    updateAreaPanel();
+    requestDraw();
   });
+  document.getElementById('clearToolBtn').addEventListener('click', () => {
+    areaPts = [];
+    updateAreaPanel();
+    requestDraw();
+  });
+  heightInput.addEventListener('input', updateAreaPanel);
+
+  document.getElementById('arcClearBtn').addEventListener('click', () => {
+    arcPts = [];
+    stakesBox.style.display = 'none';
+    updateArcPanel();
+    requestDraw();
+  });
+  stepInput.addEventListener('input', () => {
+    if (arcPts.length === 3) updateArcPanel();
+  });
+
+  // Расчёт площади и периметра (предполагаем чертёж в мм; если < 50 ед., трактуем как метры)
+  function calcPolygonStats(pts) {
+    if (pts.length < 3) return null;
+    let area2 = 0, perim = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      area2 += a.x * b.y - b.x * a.y;
+      perim += Math.hypot(b.x - a.x, b.y - a.y);
+    }
+    const rawArea = Math.abs(area2) / 2;
+    const isMeters = rawArea < 200;
+    const areaM2 = isMeters ? rawArea : rawArea / 1e6;
+    const perimM = isMeters ? perim : perim / 1000;
+    return { areaM2, perimM };
+  }
+
+  function updateAreaPanel() {
+    const st = calcPolygonStats(areaPts);
+    if (!st) {
+      panelInfo.textContent = `Точек: ${areaPts.length} (нужно минимум 3 для замкнутого контура)`;
+      return;
+    }
+    const h = parseFloat(heightInput.value);
+    const volText = (Number.isFinite(h) && h > 0) ? ` | Объём: ${(st.areaM2 * h).toFixed(3)} м³` : '';
+    panelInfo.textContent = `Площадь: ${st.areaM2.toFixed(2)} м² | Периметр: ${st.perimM.toFixed(2)} м${volText}`;
+  }
+
+  // Геометрия дуги по 3 точкам (P1 = начало, P2 = точка на дуге, P3 = конец)
+  function solveArc3Pts(p1, p2, p3) {
+    const d = 2 * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y));
+    if (Math.abs(d) < 1e-7) return null;
+
+    const p1sq = p1.x * p1.x + p1.y * p1.y;
+    const p2sq = p2.x * p2.x + p2.y * p2.y;
+    const p3sq = p3.x * p3.x + p3.y * p3.y;
+
+    const cx = (p1sq * (p2.y - p3.y) + p2sq * (p3.y - p1.y) + p3sq * (p1.y - p2.y)) / d;
+    const cy = (p1sq * (p3.x - p2.x) + p2sq * (p1.x - p3.x) + p3sq * (p2.x - p1.x)) / d;
+    const center = { x: cx, y: cy };
+    const radius = Math.hypot(p1.x - cx, p1.y - cy);
+
+    const a1 = Math.atan2(p1.y - cy, p1.x - cx);
+    const a2 = Math.atan2(p2.y - cy, p2.x - cx);
+    const a3 = Math.atan2(p3.y - cy, p3.x - cx);
+
+    const norm = (ang) => (ang + Math.PI * 2) % (Math.PI * 2);
+    const ccw12 = norm(a2 - a1);
+    const ccw13 = norm(a3 - a1);
+    const antiClockwise = ccw12 < ccw13;
+
+    // Хорда от P1 к P3
+    const chordLen = Math.hypot(p3.x - p1.x, p3.y - p1.y);
+    const chordAngle = Math.atan2(p3.y - p1.y, p3.x - p1.x);
+    // Единичный вектор перпендикуляра к хорде в сторону точки P2
+    const nx = -Math.sin(chordAngle), ny = Math.cos(chordAngle);
+    const sideSign = ((p2.x - p1.x) * nx + (p2.y - p1.y) * ny) >= 0 ? 1 : -1;
+    const px = nx * sideSign, py = ny * sideSign;
+
+    // Для каждой позиции s вдоль хорды (0..chordLen) находим пересечение луча (P1 + s*dir + t*perp) с окружностью радиуса R
+    const ux = Math.cos(chordAngle), uy = Math.sin(chordAngle);
+    const getOffsetAt = (s) => {
+      const ox = p1.x + ux * s;
+      const oy = p1.y + uy * s;
+      // (ox + t*px - cx)^2 + (oy + t*py - cy)^2 = R^2
+      const rx = ox - cx, ry = oy - cy;
+      const b = 2 * (rx * px + ry * py);
+      const c = rx * rx + ry * ry - radius * radius;
+      const disc = b * b - 4 * c;
+      if (disc < 0) return 0;
+      const t1 = (-b + Math.sqrt(disc)) / 2;
+      const t2 = (-b - Math.sqrt(disc)) / 2;
+      // Выбираем ближайший положительный/небольшой перпендикуляр к дуге
+      const candidates = [t1, t2].filter(t => t >= -radius * 0.5);
+      if (!candidates.length) return 0;
+      candidates.sort((a, bVal) => Math.abs(a) - Math.abs(bVal));
+      return candidates[0];
+    };
+
+    return { center, radius, a1, a3, antiClockwise, chordLen, ux, uy, px, py, getOffsetAt };
+  }
+
+  function formatLen(val) {
+    const abs = Math.abs(val);
+    if (abs < 50) return `${val.toFixed(2)} м`;
+    return `${val.toFixed(0)} мм (${(val / 1000).toFixed(2)} м)`;
+  }
+
+  function updateArcPanel() {
+    if (arcPts.length < 3) {
+      panelInfo.textContent = `Точек дуги: ${arcPts.length} / 3`;
+      arcHint.textContent = arcPts.length === 0 ? '1: начало' : arcPts.length === 1 ? '2: изгиб' : '3: конец';
+      stakesBox.style.display = 'none';
+      return;
+    }
+
+    const info = solveArc3Pts(arcPts[0], arcPts[1], arcPts[2]);
+    if (!info) {
+      panelInfo.textContent = 'Точки на одной прямой — не дуга';
+      stakesBox.style.display = 'none';
+      return;
+    }
+
+    const isMeters = info.radius < 50;
+    const rMeters = isMeters ? info.radius : info.radius / 1000;
+    const cMeters = isMeters ? info.chordLen : info.chordLen / 1000;
+
+    panelInfo.textContent = `R = ${formatLen(info.radius)} | Хорда = ${formatLen(info.chordLen)}`;
+    arcHint.textContent = `Шнурка: ${cMeters.toFixed(2)} м`;
+
+    const stepM = Math.max(0.1, parseFloat(stepInput.value) || 0.5);
+    const stepRaw = isMeters ? stepM : stepM * 1000;
+
+    const lines = [];
+    lines.push('От шнурки (начало → конец) перпендикуляр к дуге:');
+    for (let s = stepRaw; s < info.chordLen - stepRaw * 0.25; s += stepRaw) {
+      const off = info.getOffsetAt(s);
+      const sM = isMeters ? s : s / 1000;
+      lines.push(`  ${sM.toFixed(2)} м → ${formatLen(off)}`);
+    }
+    // Середина хорды как контрольная точка
+    const midOff = info.getOffsetAt(info.chordLen / 2);
+    lines.push(`  центр хорды (${(cMeters / 2).toFixed(2)} м) → ${formatLen(midOff)}`);
+    lines.push(`Колышек в центр: 2 рулетки по R = ${rMeters.toFixed(2)} м от концов.`);
+
+    stakesBox.textContent = lines.join('\n');
+    stakesBox.style.display = 'block';
+  }
 
   function cleanText(raw) {
     if (raw === undefined || raw === null) return '';
@@ -378,7 +609,7 @@
           const hVal = (e.textHeight || e.height || 2.5) * Math.hypot(m[0], m[1]);
           texts.push({ x: px, y: py, str, h: hVal, rot: e.rotation || 0, col });
         }
-      } else if (t && t !== 'POINT' && t !== 'VIEWPORT') {
+      } else if (t && t !== 'POINT' && t !== 'VIEWPORT' && t !== 'WIPEOUT') {
         skipped[t] = (skipped[t] || 0) + 1;
       }
     });
@@ -429,7 +660,11 @@
       }
 
       measurePts = [];
+      areaPts = [];
+      arcPts = [];
       activeDragIdx = null;
+      activeDragList = null;
+
       if (!entities.length) {
         bakedPaths.clear();
         bakedTexts = [];
@@ -449,9 +684,7 @@
 
       const skipTop = Object.entries(skipped).sort((a, b) => b[1] - a[1]).slice(0, 2)
         .map(([k, v]) => `${k}:${v}`).join(' ');
-      statusEl.textContent = skipTop
-        ? `${entities.length} эл. | скрыто: ${skipTop}`
-        : `${entities.length} эл. | OK`;
+      statusEl.textContent = skipTop ? `скрыто: ${skipTop}` : `${entities.length} эл. | OK`;
     } catch (err) {
       statusEl.textContent = `Сбой: ${err.message || err}`;
       console.error(err);
@@ -474,31 +707,28 @@
     return [(sx - offsetX) / scale, (offsetY - sy) / scale];
   }
 
-  // Магнитная привязка: 1) к углам/концам, 2) к самой линии
+  function worldToScreen(wx, wy) {
+    return [offsetX + wx * scale, offsetY - wy * scale];
+  }
+
   function findSnap(sx, sy) {
-    // Приоритет 1: углы, концы линий, центры (радиус 26px)
     let bestDist = 26 * 26;
     let bestPt = null;
     for (let i = 0; i < snapPoints.length; i += 2) {
-      const wx = snapPoints[i], wy = snapPoints[i + 1];
-      const px = offsetX + wx * scale;
-      const py = offsetY - wy * scale;
+      const [px, py] = worldToScreen(snapPoints[i], snapPoints[i + 1]);
       const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
       if (d < bestDist) {
         bestDist = d;
-        bestPt = { x: wx, y: wy, snapType: 'point' };
+        bestPt = { x: snapPoints[i], y: snapPoints[i + 1], snapType: 'point' };
       }
     }
     if (bestPt) return bestPt;
 
-    // Приоритет 2: ближайшая точка на любой линии (радиус 20px)
     let bestSegDist = 20 * 20;
     let bestSegPt = null;
     for (let i = 0; i < snapSegments.length; i += 4) {
-      const x1 = offsetX + snapSegments[i] * scale;
-      const y1 = offsetY - snapSegments[i + 1] * scale;
-      const x2 = offsetX + snapSegments[i + 2] * scale;
-      const y2 = offsetY - snapSegments[i + 3] * scale;
+      const [x1, y1] = worldToScreen(snapSegments[i], snapSegments[i + 1]);
+      const [x2, y2] = worldToScreen(snapSegments[i + 2], snapSegments[i + 3]);
       const dx = x2 - x1, dy = y2 - y1;
       const lenSq = dx * dx + dy * dy;
       if (lenSq < 1) continue;
@@ -523,9 +753,9 @@
   }
 
   function snapColor(snapType) {
-    if (snapType === 'point') return '#00e676'; // зелёный — угол/конец
-    if (snapType === 'line') return '#00e5ff';  // голубой — на линии
-    return '#ff9100';                           // оранжевый — свободно
+    if (snapType === 'point') return '#00e676';
+    if (snapType === 'line') return '#00e5ff';
+    return '#ff9100';
   }
 
   function drawLoupe(pt) {
@@ -577,6 +807,25 @@
     ctx.restore();
   }
 
+  function drawPointHandle(sx, sy, snapType, isActive, labelText = '') {
+    const col = snapColor(snapType);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(sx, sy, 15, 0, Math.PI * 2);
+    ctx.fillStyle = isActive ? 'rgba(0, 230, 118, 0.25)' : 'rgba(255, 255, 255, 0.12)';
+    ctx.fill();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.strokeRect(sx - 4, sy - 4, 8, 8);
+    if (labelText) {
+      ctx.font = 'bold 11px system-ui, sans-serif';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(labelText, sx + 10, sy - 8);
+    }
+    ctx.restore();
+  }
+
   function draw() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
@@ -597,8 +846,7 @@
       const t = bakedTexts[i];
       const pxH = t.h * scale;
       if (pxH < 5) continue;
-      const sx = offsetX + t.x * scale;
-      const sy = offsetY - t.y * scale;
+      const [sx, sy] = worldToScreen(t.x, t.y);
       if (sx < -200 || sx > w + 200 || sy < -50 || sy > h + 50) continue;
 
       ctx.save();
@@ -610,13 +858,12 @@
       ctx.restore();
     }
 
-    // Линейка
+    // 1. Линейка
     if (measurePts.length) {
-      const ptsScreen = measurePts.map(p => ({
-        sx: offsetX + p.x * scale,
-        sy: offsetY - p.y * scale,
-        snapType: p.snapType
-      }));
+      const ptsScreen = measurePts.map(p => {
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        return { sx, sy, snapType: p.snapType };
+      });
 
       if (ptsScreen.length === 2) {
         const [a, b] = ptsScreen;
@@ -631,7 +878,7 @@
         ctx.restore();
 
         const dist = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
-        const label = dist >= 1000 ? `${dist.toFixed(0)} (${(dist / 1000).toFixed(2)} м)` : dist.toFixed(1);
+        const label = dist >= 1000 ? `${dist.toFixed(0)} (${(dist / 1000).toFixed(2)} м)` : dist.toFixed(2);
         const mx = (a.sx + b.sx) / 2;
         const my = (a.sy + b.sy) / 2 - 14;
 
@@ -647,24 +894,139 @@
       }
 
       for (let i = 0; i < ptsScreen.length; i++) {
-        const p = ptsScreen[i];
-        const col = snapColor(p.snapType);
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(p.sx, p.sy, 16, 0, Math.PI * 2);
-        ctx.fillStyle = i === activeDragIdx ? 'rgba(0, 230, 118, 0.25)' : 'rgba(255, 255, 255, 0.12)';
-        ctx.fill();
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        ctx.strokeRect(p.sx - 4, p.sy - 4, 8, 8);
-        ctx.restore();
+        drawPointHandle(ptsScreen[i].sx, ptsScreen[i].sy, ptsScreen[i].snapType, activeDragList === 'measure' && activeDragIdx === i);
       }
     }
 
-    if (activeDragIdx !== null && measurePts[activeDragIdx]) {
-      drawLoupe(measurePts[activeDragIdx]);
+    // 2. Площадь / Объём
+    if (areaPts.length) {
+      const sPts = areaPts.map(p => {
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        return { sx, sy, snapType: p.snapType };
+      });
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(sPts[0].sx, sPts[0].sy);
+      for (let i = 1; i < sPts.length; i++) ctx.lineTo(sPts[i].sx, sPts[i].sy);
+      if (sPts.length >= 3) ctx.closePath();
+      if (sPts.length >= 3) {
+        ctx.fillStyle = 'rgba(0, 230, 118, 0.16)';
+        ctx.fill();
+      }
+      ctx.strokeStyle = '#00e676';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+
+      for (let i = 0; i < sPts.length; i++) {
+        drawPointHandle(sPts[i].sx, sPts[i].sy, sPts[i].snapType, activeDragList === 'area' && activeDragIdx === i, `${i + 1}`);
+      }
     }
+
+    // 3. Дуга и разбивка для колышков
+    if (arcPts.length) {
+      const sPts = arcPts.map(p => {
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        return { sx, sy, snapType: p.snapType };
+      });
+
+      if (arcPts.length === 3) {
+        const info = solveArc3Pts(arcPts[0], arcPts[1], arcPts[2]);
+        if (info) {
+          // Хорда (шнурка от начала до конца)
+          const [x1s, y1s] = worldToScreen(arcPts[0].x, arcPts[0].y);
+          const [x3s, y3s] = worldToScreen(arcPts[2].x, arcPts[2].y);
+          ctx.save();
+          ctx.strokeStyle = '#00e5ff';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x1s, y1s);
+          ctx.lineTo(x3s, y3s);
+          ctx.stroke();
+          ctx.restore();
+
+          // Подсвеченная дуга в мировых координатах
+          ctx.save();
+          ctx.translate(offsetX, offsetY);
+          ctx.scale(scale, -scale);
+          ctx.strokeStyle = '#ffd60a';
+          ctx.lineWidth = 2.5 / scale;
+          ctx.beginPath();
+          ctx.arc(info.center.x, info.center.y, info.radius, info.a1, info.a3, info.antiClockwise);
+          ctx.stroke();
+          ctx.restore();
+
+          // Центр дуги (крестик)
+          const [csx, csy] = worldToScreen(info.center.x, info.center.y);
+          ctx.save();
+          ctx.strokeStyle = '#ff2d55';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(csx - 10, csy); ctx.lineTo(csx + 10, csy);
+          ctx.moveTo(csx, csy - 10); ctx.lineTo(csx, csy + 10);
+          ctx.stroke();
+          ctx.font = 'bold 11px system-ui, sans-serif';
+          ctx.fillStyle = '#ff2d55';
+          ctx.fillText('ЦЕНТР', csx + 8, csy - 6);
+          ctx.restore();
+
+          // Перпендикуляры от шнурки к дуге с шагом
+          const isMeters = info.radius < 50;
+          const stepM = Math.max(0.1, parseFloat(stepInput.value) || 0.5);
+          const stepRaw = isMeters ? stepM : stepM * 1000;
+
+          ctx.save();
+          ctx.strokeStyle = 'rgba(255, 214, 10, 0.7)';
+          ctx.lineWidth = 1.2;
+          ctx.font = '10px system-ui, sans-serif';
+          ctx.fillStyle = '#ffd60a';
+          for (let s = stepRaw; s < info.chordLen - stepRaw * 0.25; s += stepRaw) {
+            const off = info.getOffsetAt(s);
+            const bx = arcPts[0].x + info.ux * s;
+            const by = arcPts[0].y + info.uy * s;
+            const ax = bx + info.px * off;
+            const ay = by + info.py * off;
+
+            const [bsx, bsy] = worldToScreen(bx, by);
+            const [asx, asy] = worldToScreen(ax, ay);
+
+            ctx.beginPath();
+            ctx.moveTo(bsx, bsy);
+            ctx.lineTo(asx, asy);
+            ctx.stroke();
+
+            const valStr = isMeters ? `${Math.abs(off).toFixed(2)}м` : `${Math.round(Math.abs(off))}`;
+            ctx.fillText(valStr, asx + 4, asy - 3);
+          }
+          ctx.restore();
+        }
+      }
+
+      for (let i = 0; i < sPts.length; i++) {
+        drawPointHandle(sPts[i].sx, sPts[i].sy, sPts[i].snapType, activeDragList === 'arc' && activeDragIdx === i, `${i + 1}`);
+      }
+    }
+
+    // Лупа при перетаскивании любой точки
+    let loupeTarget = null;
+    if (activeDragIdx !== null) {
+      if (activeDragList === 'measure') loupeTarget = measurePts[activeDragIdx];
+      else if (activeDragList === 'area') loupeTarget = areaPts[activeDragIdx];
+      else if (activeDragList === 'arc') loupeTarget = arcPts[activeDragIdx];
+    }
+    if (loupeTarget) drawLoupe(loupeTarget);
+  }
+
+  function hitTestList(list, sx, sy) {
+    let hitIdx = null, bestD = 34 * 34;
+    for (let i = 0; i < list.length; i++) {
+      const [px, py] = worldToScreen(list[i].x, list[i].y);
+      const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
+      if (d < bestD) { bestD = d; hitIdx = i; }
+    }
+    return hitIdx;
   }
 
   let pointers = new Map(), lastDist = 0, lastCenter = null;
@@ -680,21 +1042,19 @@
       downPos = { x: e.clientX, y: e.clientY };
       moved = false;
 
-      if (measureMode && measurePts.length) {
-        let hitIdx = null, bestD = 36 * 36;
-        for (let i = 0; i < measurePts.length; i++) {
-          const px = offsetX + measurePts[i].x * scale;
-          const py = offsetY - measurePts[i].y * scale;
-          const d = (px - sx) * (px - sx) + (py - sy) * (py - sy);
-          if (d < bestD) { bestD = d; hitIdx = i; }
-        }
-        if (hitIdx !== null) {
-          activeDragIdx = hitIdx;
-          requestDraw();
-        }
+      if (toolMode === 'ruler' && measurePts.length) {
+        const idx = hitTestList(measurePts, sx, sy);
+        if (idx !== null) { activeDragList = 'measure'; activeDragIdx = idx; requestDraw(); }
+      } else if (toolMode === 'area' && areaPts.length) {
+        const idx = hitTestList(areaPts, sx, sy);
+        if (idx !== null) { activeDragList = 'area'; activeDragIdx = idx; requestDraw(); }
+      } else if (toolMode === 'arc' && arcPts.length) {
+        const idx = hitTestList(arcPts, sx, sy);
+        if (idx !== null) { activeDragList = 'arc'; activeDragIdx = idx; requestDraw(); }
       }
     } else if (pointers.size === 2) {
       activeDragIdx = null;
+      activeDragList = null;
       moved = true;
       const [p1, p2] = [...pointers.values()];
       lastDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
@@ -709,15 +1069,21 @@
     pointers.set(e.pointerId, curr);
 
     if (pointers.size === 1) {
-      if (activeDragIdx !== null) {
+      if (activeDragIdx !== null && activeDragList) {
         const rect = canvas.getBoundingClientRect();
-        measurePts[activeDragIdx] = findSnap(e.clientX - rect.left, e.clientY - rect.top);
-        if (measurePts.length === 2) {
-          const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
-          statusEl.textContent = `Замер: ${d.toFixed(1)}`;
-        } else {
-          const st = measurePts[0].snapType;
-          statusEl.textContent = st === 'point' ? 'Угол!' : st === 'line' ? 'Линия!' : 'Точка 1';
+        const pt = findSnap(e.clientX - rect.left, e.clientY - rect.top);
+        if (activeDragList === 'measure') {
+          measurePts[activeDragIdx] = pt;
+          if (measurePts.length === 2) {
+            const d = Math.hypot(measurePts[1].x - measurePts[0].x, measurePts[1].y - measurePts[0].y);
+            statusEl.textContent = `Замер: ${d.toFixed(1)}`;
+          }
+        } else if (activeDragList === 'area') {
+          areaPts[activeDragIdx] = pt;
+          updateAreaPanel();
+        } else if (activeDragList === 'arc') {
+          arcPts[activeDragIdx] = pt;
+          updateArcPanel();
         }
         requestDraw();
         return;
@@ -744,22 +1110,35 @@
   });
 
   const endPointer = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+
     if (activeDragIdx !== null) {
-      if (measurePts.length === 1) {
-        const p0x = offsetX + measurePts[0].x * scale;
-        const p0y = offsetY - measurePts[0].y * scale;
+      if (activeDragList === 'measure' && measurePts.length === 1) {
+        const [p0x, p0y] = worldToScreen(measurePts[0].x, measurePts[0].y);
         const shiftX = p0x + 80 < canvas.clientWidth ? 80 : -80;
         measurePts.push(findSnap(p0x + shiftX, p0y));
         statusEl.textContent = 'Тащи точку 2';
       }
       activeDragIdx = null;
+      activeDragList = null;
       requestDraw();
-    } else if (measureMode && !moved && pointers.size === 1) {
-      const rect = canvas.getBoundingClientRect();
-      const pt = findSnap(e.clientX - rect.left, e.clientY - rect.top);
-      if (measurePts.length >= 2) measurePts = [pt];
-      else measurePts.push(pt);
-      requestDraw();
+    } else if (!moved && pointers.size === 1) {
+      if (toolMode === 'ruler') {
+        const pt = findSnap(sx, sy);
+        if (measurePts.length >= 2) measurePts = [pt];
+        else measurePts.push(pt);
+        requestDraw();
+      } else if (toolMode === 'area') {
+        areaPts.push(findSnap(sx, sy));
+        updateAreaPanel();
+        requestDraw();
+      } else if (toolMode === 'arc') {
+        if (arcPts.length >= 3) arcPts = [findSnap(sx, sy)];
+        else arcPts.push(findSnap(sx, sy));
+        updateArcPanel();
+        requestDraw();
+      }
     }
     pointers.delete(e.pointerId);
     lastDist = 0;
@@ -777,6 +1156,13 @@
     scale *= factor;
     requestDraw();
   }, { passive: false });
+
+  // Регистрация Service Worker для офлайн-работы PWA
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
+    });
+  }
 </script>
 </body>
 </html>
